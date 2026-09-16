@@ -306,11 +306,14 @@ mod tests {
         }
     }
 
+    /// A statement and the parameters it was called with.
+    type Call = (String, Vec<Param>);
+
     /// Every call made against a `StubConnection` lands here, so a test can
     /// check the statement and parameters the store built even after the
     /// connection has been moved into the store behind `Box<dyn Connection>`.
     #[derive(Clone, Default)]
-    struct CallLog(Arc<Mutex<Vec<(String, Vec<Param>)>>>);
+    struct CallLog(Arc<Mutex<Vec<Call>>>);
 
     impl CallLog {
         fn record(&self, statement: &str, params: &[Param]) {
@@ -320,7 +323,7 @@ mod tests {
                 .push((statement.to_string(), params.to_vec()));
         }
 
-        fn last(&self) -> (String, Vec<Param>) {
+        fn last(&self) -> Call {
             self.0
                 .lock()
                 .unwrap()
