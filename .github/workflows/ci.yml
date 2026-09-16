@@ -1,0 +1,72 @@
+# Nothing merges on the word of whoever ran the commands locally.
+#
+# One platform, not two: what this proves is that the battery this project
+# declares is green — not that it is portable.
+# Only GitHub's own actions are used, on major tags: an action nobody reads
+# is a dependency nobody reviews, and these two are GitHub's own, inside a
+# trust boundary these runners already put us well inside.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [dev, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy, warnings included
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-features
+
+  supply-chain:
+    name: supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+          key: audit-tools-${{ hashFiles('**/Cargo.lock', 'deny.toml') }}
+          restore-keys: audit-tools-
+
+      - name: Install the two auditors if the cache did not carry them
+        run: |
+          command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
+          command -v cargo-deny  >/dev/null || cargo install cargo-deny  --locked
+
+      - name: Known vulnerabilities
+        run: cargo audit --deny warnings
+
+      # The full check, advisories included. This is the one place that stage
+      # can run: it reads the RustSec database from github.com, which is this
+      # project's forge and therefore a domain no agent's allowlist may name.
+      # The battery inside the container plays the other three stages.
+      - name: Licences, bans and sources
+        run: cargo deny check

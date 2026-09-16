@@ -1,0 +1,9 @@
+[package]
+name = "notes-api"
+version = "0.1.0"
+edition = "2024"
+# Not decoration: the battery runs `cargo deny check`, whose `licenses` stage
+# refuses a crate that declares none — which is what `cargo new` leaves.
+license = "Apache-2.0"
+
+[dependencies]

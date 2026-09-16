@@ -1,0 +1,54 @@
+# The supply-chain gate for this project. `cargo audit` answers "is anything
+# here known to be vulnerable"; this file answers the two questions it does
+# not: what licences we accept, and what we refuse to carry at all.
+#
+# Without this file cargo-deny falls back to a default configuration and says
+# so on every run, and an unlicensed crate — which is what a fresh
+# `cargo new` produces — fails the `licenses` stage outright.
+
+[advisories]
+# Anything RustSec knows about is an error. Ignoring one must be a written
+# decision, listed here with the reason.
+#
+# This stage is the one the battery inside the container does not play: it
+# fetches the RustSec database from github.com, and github.com is this
+# project's forge — a domain the coder's allowlist must never name. CI plays
+# it instead, where reaching the forge is nobody's privilege escalation.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive only, plus ISC and the BSD pair, which are the same kind of
+# licence and turn up constantly in transitive dependencies. A copyleft
+# licence appearing here is a decision to take, not a line to add quietly.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+# Listing a permissive licence the tree does not happen to use today is not a
+# finding; it is how the list stays stable when a dependency changes.
+unused-allowed-license = "allow"
+
+[bans]
+# Two copies of one crate is how a supply-chain surprise usually arrives, and
+# how build times quietly double. A warning, not an error: the fix is often
+# upstream's to make.
+multiple-versions = "warn"
+wildcards = "deny"
+deny = []
+
+[sources]
+# Nothing from anywhere but crates.io: a git dependency is a dependency
+# nobody reviews.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []
