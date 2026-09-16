@@ -69,22 +69,30 @@ impl Store for PostgresStore {
     fn create(&self, title: String, body: String) -> Result<Note, StoreError> {
         block_in_place(|| {
             Handle::current().block_on(async {
+                // `TIMESTAMPTZ` keeps microseconds, not nanoseconds:
+                // truncated here, so the note this call returns already
+                // matches what a later `get` or `list` reads back,
+                // rather than differing from it by whatever Postgres
+                // would have dropped.
+                let now = chrono::Utc::now().trunc_subsecs(6);
                 let note = Note {
                     id: Uuid::new_v4(),
                     title,
                     body,
-                    // `TIMESTAMPTZ` keeps microseconds, not nanoseconds:
-                    // truncated here, so the note this call returns already
-                    // matches what a later `get` or `list` reads back,
-                    // rather than differing from it by whatever Postgres
-                    // would have dropped.
-                    created_at: chrono::Utc::now().trunc_subsecs(6),
+                    created_at: now,
+                    updated_at: now,
                 };
 
                 self.client
                     .execute(
-                        "INSERT INTO notes (id, title, body, created_at) VALUES ($1, $2, $3, $4)",
-                        &[&note.id, &note.title, &note.body, &note.created_at],
+                        "INSERT INTO notes (id, title, body, created_at, updated_at) VALUES ($1, $2, $3, $4, $5)",
+                        &[
+                            &note.id,
+                            &note.title,
+                            &note.body,
+                            &note.created_at,
+                            &note.updated_at,
+                        ],
                     )
                     .await
                     .map_err(|err| StoreError(format!("creating a note: {err}")))?;
@@ -100,7 +108,7 @@ impl Store for PostgresStore {
                 let row = self
                     .client
                     .query_opt(
-                        "SELECT id, title, body, created_at FROM notes WHERE id = $1",
+                        "SELECT id, title, body, created_at, updated_at FROM notes WHERE id = $1",
                         &[&id],
                     )
                     .await
@@ -111,6 +119,7 @@ impl Store for PostgresStore {
                     title: row.get(1),
                     body: row.get(2),
                     created_at: row.get(3),
+                    updated_at: row.get(4),
                 }))
             })
         })
@@ -122,7 +131,7 @@ impl Store for PostgresStore {
                 let rows = self
                     .client
                     .query(
-                        "SELECT id, title, body, created_at FROM notes ORDER BY seq DESC",
+                        "SELECT id, title, body, created_at, updated_at FROM notes ORDER BY seq DESC",
                         &[],
                     )
                     .await
@@ -135,8 +144,53 @@ impl Store for PostgresStore {
                         title: row.get(1),
                         body: row.get(2),
                         created_at: row.get(3),
+                        updated_at: row.get(4),
                     })
                     .collect())
+            })
+        })
+    }
+
+    fn update(&self, id: Uuid, title: String, body: String) -> Result<Option<Note>, StoreError> {
+        block_in_place(|| {
+            Handle::current().block_on(async {
+                // Truncated for the same reason as `create`'s `created_at`:
+                // what this call returns must match what a later `get`
+                // reads back from `TIMESTAMPTZ`.
+                let updated_at = chrono::Utc::now().trunc_subsecs(6);
+
+                let row = self
+                    .client
+                    .query_opt(
+                        "UPDATE notes SET title = $2, body = $3, updated_at = $4 \
+                         WHERE id = $1 \
+                         RETURNING id, title, body, created_at, updated_at",
+                        &[&id, &title, &body, &updated_at],
+                    )
+                    .await
+                    .map_err(|err| StoreError(format!("updating a note: {err}")))?;
+
+                Ok(row.map(|row| Note {
+                    id: row.get(0),
+                    title: row.get(1),
+                    body: row.get(2),
+                    created_at: row.get(3),
+                    updated_at: row.get(4),
+                }))
+            })
+        })
+    }
+
+    fn delete(&self, id: Uuid) -> Result<bool, StoreError> {
+        block_in_place(|| {
+            Handle::current().block_on(async {
+                let deleted = self
+                    .client
+                    .execute("DELETE FROM notes WHERE id = $1", &[&id])
+                    .await
+                    .map_err(|err| StoreError(format!("deleting a note: {err}")))?;
+
+                Ok(deleted > 0)
             })
         })
     }

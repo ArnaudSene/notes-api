@@ -26,6 +26,8 @@ pub trait Store: Send + Sync {
     fn create(&self, title: String, body: String) -> Result<Note, StoreError>;
     fn get(&self, id: Uuid) -> Result<Option<Note>, StoreError>;
     fn list(&self) -> Result<Vec<Note>, StoreError>;
+    fn update(&self, id: Uuid, title: String, body: String) -> Result<Option<Note>, StoreError>;
+    fn delete(&self, id: Uuid) -> Result<bool, StoreError>;
 }
 
 #[cfg(test)]

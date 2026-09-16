@@ -9,4 +9,5 @@ pub struct Note {
     pub title: String,
     pub body: String,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
