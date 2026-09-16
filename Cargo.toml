@@ -11,6 +11,7 @@ axum = { version = "0.8", default-features = false, features = ["json", "tokio",
 chrono = { version = "0.4", default-features = false, features = ["now", "serde"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]

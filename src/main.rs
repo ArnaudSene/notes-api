@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use notes_api::api::{AppState, router};
 use notes_api::config::Config;
+use notes_api::store::Store;
 use notes_api::store::memory::MemoryStore;
+use notes_api::store::postgres::PostgresStore;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -15,8 +17,19 @@ async fn main() -> ExitCode {
         }
     };
 
+    let store: Arc<dyn Store> = match &config.database_url {
+        Some(database_url) => match PostgresStore::connect(database_url).await {
+            Ok(store) => Arc::new(store),
+            Err(err) => {
+                eprintln!("notes-api: {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => Arc::new(MemoryStore::new()),
+    };
+
     let state = AppState {
-        store: Arc::new(MemoryStore::new()),
+        store,
         token: Arc::from(config.token.as_str()),
     };
 
