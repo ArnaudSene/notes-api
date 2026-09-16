@@ -20,12 +20,15 @@ pub struct AppState {
     pub token: Arc<str>,
 }
 
-/// The router this service serves: the three routes, behind the token
+/// The router this service serves: the five routes, behind the token
 /// guard.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/notes", post(create_note).get(list_notes))
-        .route("/notes/{id}", get(get_note))
+        .route(
+            "/notes/{id}",
+            get(get_note).put(update_note).delete(delete_note),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state)
 }
@@ -62,6 +65,48 @@ async fn get_note(State(state): State<AppState>, Path(id): Path<String>) -> Resp
     match state.store.get(id) {
         Ok(Some(note)) => (StatusCode::OK, Json(note)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateNote {
+    title: String,
+    body: String,
+}
+
+async fn update_note(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateNote>, JsonRejection>,
+) -> Response {
+    let Ok(id) = Uuid::parse_str(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let Ok(Json(update)) = body else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+
+    if update.title.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    match state.store.update(id, update.title, update.body) {
+        Ok(Some(note)) => (StatusCode::OK, Json(note)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn delete_note(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let Ok(id) = Uuid::parse_str(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    match state.store.delete(id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -150,6 +195,39 @@ mod tests {
                 serde_json::json!({ "title": title, "body": body }).to_string(),
             ))
             .unwrap()
+    }
+
+    fn put_request(id: &str, title: &str, body: &str) -> HttpRequest<Body> {
+        authed(
+            HttpRequest::builder()
+                .method("PUT")
+                .uri(format!("/notes/{id}")),
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({ "title": title, "body": body }).to_string(),
+        ))
+        .unwrap()
+    }
+
+    fn delete_request(id: &str) -> HttpRequest<Body> {
+        authed(
+            HttpRequest::builder()
+                .method("DELETE")
+                .uri(format!("/notes/{id}")),
+        )
+        .body(Body::empty())
+        .unwrap()
+    }
+
+    fn get_request(id: &str) -> HttpRequest<Body> {
+        authed(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!("/notes/{id}")),
+        )
+        .body(Body::empty())
+        .unwrap()
     }
 
     #[tokio::test]
@@ -375,6 +453,321 @@ mod tests {
             .uri("/notes")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"title": "t", "body": "b"}"#))
+            .unwrap();
+
+        let response = app().oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn put_notes_id_replaces_title_and_body() {
+        let app = app();
+
+        let created = app
+            .clone()
+            .oneshot(create_request("groceries", "milk, eggs"))
+            .await
+            .unwrap();
+        let created = body_json(created).await;
+        let id = created["id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(put_request(id, "new title", "new body"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = body_json(response).await;
+        assert_eq!(updated["id"], created["id"]);
+        assert_eq!(updated["title"], "new title");
+        assert_eq!(updated["body"], "new body");
+        assert_eq!(updated["created_at"], created["created_at"]);
+    }
+
+    #[tokio::test]
+    async fn put_notes_id_moves_updated_at_forward() {
+        let app = app();
+
+        let created = app
+            .clone()
+            .oneshot(create_request("groceries", "milk, eggs"))
+            .await
+            .unwrap();
+        let created = body_json(created).await;
+        let id = created["id"].as_str().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        let response = app
+            .oneshot(put_request(id, "new title", "new body"))
+            .await
+            .unwrap();
+
+        let updated = body_json(response).await;
+        let created_updated_at = created["updated_at"].as_str().unwrap();
+        let new_updated_at = updated["updated_at"].as_str().unwrap();
+        assert!(new_updated_at > created_updated_at);
+    }
+
+    #[tokio::test]
+    async fn put_notes_id_is_reflected_by_a_later_get() {
+        let app = app();
+
+        let created = app
+            .clone()
+            .oneshot(create_request("groceries", "milk, eggs"))
+            .await
+            .unwrap();
+        let created = body_json(created).await;
+        let id = created["id"].as_str().unwrap();
+
+        let put_response = app
+            .clone()
+            .oneshot(put_request(id, "new title", "new body"))
+            .await
+            .unwrap();
+        let updated = body_json(put_response).await;
+
+        let get_response = app.oneshot(get_request(id)).await.unwrap();
+        let fetched = body_json(get_response).await;
+
+        assert_eq!(fetched, updated);
+    }
+
+    #[tokio::test]
+    async fn put_notes_id_of_an_unknown_id_is_404() {
+        let request = put_request(&Uuid::new_v4().to_string(), "title", "body");
+
+        let response = app().oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn put_notes_id_of_a_malformed_id_is_404() {
+        let request = put_request("not-a-uuid", "title", "body");
+
+        let response = app().oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn put_notes_id_rejects_an_empty_title() {
+        let app = app();
+
+        let created = app
+            .clone()
+            .oneshot(create_request("groceries", "milk, eggs"))
+            .await
+            .unwrap();
+        let created = body_json(created).await;
+        let id = created["id"].as_str().unwrap();
+
+        let response = app.oneshot(put_request(id, "", "new body")).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn put_notes_id_rejects_a_body_that_is_not_a_note() {
+        let app = app();
+
+        let created = app
+            .clone()
+            .oneshot(create_request("groceries", "milk, eggs"))
+            .await
+            .unwrap();
+        let created = body_json(created).await;
+        let id = created["id"].as_str().unwrap();
+
+        let request = authed(
+            HttpRequest::builder()
+                .method("PUT")
+                .uri(format!("/notes/{id}")),
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"title": "no body field"}"#))
+        .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn put_notes_id_rejects_a_body_that_is_not_json_at_all() {
+        let app = app();
+
+        let created = app
+            .clone()
+            .oneshot(create_request("groceries", "milk, eggs"))
+            .await
+            .unwrap();
+        let created = body_json(created).await;
+        let id = created["id"].as_str().unwrap();
+
+        let request = authed(
+            HttpRequest::builder()
+                .method("PUT")
+                .uri(format!("/notes/{id}")),
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("not json"))
+        .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_failed_put_changes_nothing() {
+        let app = app();
+
+        let created = app
+            .clone()
+            .oneshot(create_request("groceries", "milk, eggs"))
+            .await
+            .unwrap();
+        let created = body_json(created).await;
+        let id = created["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(put_request(id, "", "new body"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let get_response = app.oneshot(get_request(id)).await.unwrap();
+        let fetched = body_json(get_response).await;
+
+        assert_eq!(fetched, created);
+    }
+
+    #[tokio::test]
+    async fn delete_notes_id_removes_the_note() {
+        let app = app();
+
+        let created = app
+            .clone()
+            .oneshot(create_request("groceries", "milk, eggs"))
+            .await
+            .unwrap();
+        let created = body_json(created).await;
+        let id = created["id"].as_str().unwrap();
+
+        let response = app.clone().oneshot(delete_request(id)).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_deleted_note_is_unreachable_to_get() {
+        let app = app();
+
+        let created = app
+            .clone()
+            .oneshot(create_request("groceries", "milk, eggs"))
+            .await
+            .unwrap();
+        let created = body_json(created).await;
+        let id = created["id"].as_str().unwrap();
+
+        app.clone().oneshot(delete_request(id)).await.unwrap();
+        let response = app.oneshot(get_request(id)).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_notes_id_twice_is_404_the_second_time() {
+        let app = app();
+
+        let created = app
+            .clone()
+            .oneshot(create_request("groceries", "milk, eggs"))
+            .await
+            .unwrap();
+        let created = body_json(created).await;
+        let id = created["id"].as_str().unwrap();
+
+        let first = app.clone().oneshot(delete_request(id)).await.unwrap();
+        let second = app.oneshot(delete_request(id)).await.unwrap();
+
+        assert_eq!(first.status(), StatusCode::NO_CONTENT);
+        assert_eq!(second.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_notes_id_of_an_unknown_id_is_404() {
+        let request = delete_request(&Uuid::new_v4().to_string());
+
+        let response = app().oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_notes_id_of_a_malformed_id_is_404() {
+        let request = delete_request("not-a-uuid");
+
+        let response = app().oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn deleting_one_note_leaves_another_reachable() {
+        let app = app();
+
+        let first = app
+            .clone()
+            .oneshot(create_request("first", "1"))
+            .await
+            .unwrap();
+        let first = body_json(first).await;
+        let first_id = first["id"].as_str().unwrap();
+
+        let second = app
+            .clone()
+            .oneshot(create_request("second", "2"))
+            .await
+            .unwrap();
+        let second = body_json(second).await;
+        let second_id = second["id"].as_str().unwrap();
+
+        app.clone().oneshot(delete_request(first_id)).await.unwrap();
+        let response = app.oneshot(get_request(second_id)).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let fetched = body_json(response).await;
+        assert_eq!(fetched, second);
+    }
+
+    #[tokio::test]
+    async fn no_authorization_header_is_401_for_put() {
+        let request = HttpRequest::builder()
+            .method("PUT")
+            .uri(format!("/notes/{}", Uuid::new_v4()))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"title": "t", "body": "b"}"#))
+            .unwrap();
+
+        let response = app().oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn no_authorization_header_is_401_for_delete() {
+        let request = HttpRequest::builder()
+            .method("DELETE")
+            .uri(format!("/notes/{}", Uuid::new_v4()))
+            .body(Body::empty())
             .unwrap();
 
         let response = app().oneshot(request).await.unwrap();
