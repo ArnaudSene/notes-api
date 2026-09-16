@@ -1,0 +1,24 @@
+# The services this project runs against. nunki merges this block into every
+# system profile: it lifts them beside the integrator and the security agent,
+# once per slot, and never stops them between two profiles — so migrations and
+# fixtures survive the switch. The coder never sees them.
+#
+# Test credentials, and nothing else: this database is disposable, it holds no
+# data anybody would miss, and it is reachable only from the slot's own
+# network.
+#
+# No named volume on purpose: nothing here has to outlive a slot, and a service
+# naming a volume this file does not declare makes the whole Compose project
+# invalid.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: notes
+      POSTGRES_PASSWORD: notes-for-tests
+      POSTGRES_DB: notes
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notes -d notes"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
