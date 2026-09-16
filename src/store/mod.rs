@@ -26,3 +26,15 @@ pub trait Store: Send + Sync {
     fn get(&self, id: Uuid) -> Result<Option<Note>, StoreError>;
     fn list(&self) -> Result<Vec<Note>, StoreError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_error_displays_its_message() {
+        let error = StoreError("the store's lock was poisoned".to_string());
+
+        assert_eq!(error.to_string(), "the store's lock was poisoned");
+    }
+}

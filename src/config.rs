@@ -93,6 +93,18 @@ mod tests {
     }
 
     #[test]
+    fn debug_redacts_the_token_but_shows_the_rest() {
+        let config =
+            Config::from_vars(vars(&[("NOTES_TOKEN", "secret"), ("PORT", "9999")])).unwrap();
+
+        let debug = format!("{config:?}");
+
+        assert!(!debug.contains("secret"));
+        assert!(debug.contains("redacted"));
+        assert!(debug.contains("9999"));
+    }
+
+    #[test]
     fn missing_token_is_an_error() {
         let result = Config::from_vars(vars(&[]));
 

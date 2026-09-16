@@ -323,6 +323,23 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// A header whose first 7 bytes are not the "Bearer " scheme, but whose
+    /// remaining bytes happen to equal the token exactly, must still be
+    /// rejected — the scheme is checked, not just the tail of the header.
+    #[tokio::test]
+    async fn a_header_with_a_wrong_scheme_of_the_same_length_as_bearer_is_401() {
+        let request = HttpRequest::builder()
+            .method("GET")
+            .uri("/notes")
+            .header(header::AUTHORIZATION, format!("1234567{TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app().oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn a_token_that_differs_is_401() {
         let request = HttpRequest::builder()
