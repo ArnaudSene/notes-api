@@ -190,8 +190,31 @@ impl Store for PostgresStore {
                     .await
                     .map_err(|err| StoreError(format!("deleting a note: {err}")))?;
 
-                Ok(deleted > 0)
+                Ok(rows_were_deleted(deleted))
             })
         })
+    }
+}
+
+/// Whether a `DELETE` actually removed a row. `execute` hands back how many
+/// rows the statement touched; zero is the only count that means "no row
+/// anywhere had this id" rather than "one was removed".
+fn rows_were_deleted(row_count: u64) -> bool {
+    row_count > 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rows_were_deleted;
+
+    #[test]
+    fn zero_affected_rows_means_nothing_was_deleted() {
+        assert!(!rows_were_deleted(0));
+    }
+
+    #[test]
+    fn one_or_more_affected_rows_means_something_was_deleted() {
+        assert!(rows_were_deleted(1));
+        assert!(rows_were_deleted(2));
     }
 }
