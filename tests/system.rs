@@ -95,6 +95,84 @@ fn the_same_title_twice_does_not_collide() {
 
 #[test]
 #[ignore = "system test: needs the services"]
+fn a_note_changed_through_one_process_is_read_back_changed_by_another() {
+    let db_url = database_url();
+    let token = "system-update-token";
+
+    let updated = {
+        let service = Service::start(&db_url, token, unique_port());
+        let (status, created) = service.post_note("shopping", "milk");
+        assert_eq!(status, 201);
+
+        let id = created["id"].as_str().expect("the created note has an id");
+        let (status, updated) = service.put_note(id, "shopping list", "milk, eggs");
+        assert_eq!(status, 200);
+        updated
+        // `service` is dropped here: the process that wrote the change is
+        // killed before the next one reads it back.
+    };
+
+    let service = Service::start(&db_url, token, unique_port());
+    let id = updated["id"].as_str().expect("the updated note has an id");
+    let (status, fetched) = service.get_note(id);
+
+    assert_eq!(status, 200);
+    assert_eq!(fetched, updated);
+}
+
+#[test]
+#[ignore = "system test: needs the services"]
+fn updated_at_moves_on_a_put_and_created_at_does_not() {
+    let service = Service::start(&database_url(), "system-timestamps-token", unique_port());
+
+    let (status, created) = service.post_note("draft", "v1");
+    assert_eq!(status, 201);
+    assert_eq!(created["created_at"], created["updated_at"]);
+
+    let id = created["id"].as_str().expect("the created note has an id");
+    let (status, updated) = service.put_note(id, "draft", "v2");
+    assert_eq!(status, 200);
+
+    assert_eq!(
+        updated["created_at"], created["created_at"],
+        "created_at must not move on a PUT"
+    );
+    assert_ne!(
+        updated["updated_at"], created["updated_at"],
+        "updated_at must move on a PUT"
+    );
+}
+
+#[test]
+#[ignore = "system test: needs the services"]
+fn a_deleted_note_is_gone_after_a_restart() {
+    let db_url = database_url();
+    let token = "system-delete-token";
+
+    let id = {
+        let service = Service::start(&db_url, token, unique_port());
+        let (status, created) = service.post_note("temporary", "gone soon");
+        assert_eq!(status, 201);
+        let id = created["id"]
+            .as_str()
+            .expect("the created note has an id")
+            .to_string();
+
+        let (status, _) = service.delete_note(&id);
+        assert_eq!(status, 204);
+        id
+        // `service` is dropped here: the process that deleted the note is
+        // killed before the next one looks for it.
+    };
+
+    let service = Service::start(&db_url, token, unique_port());
+    let (status, _) = service.get_note(&id);
+
+    assert_eq!(status, 404);
+}
+
+#[test]
+#[ignore = "system test: needs the services"]
 fn migrations_apply_cleanly_twice_in_a_row() {
     let runtime = tokio::runtime::Runtime::new().expect("build a runtime for this test");
     let url = database_url();

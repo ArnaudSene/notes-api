@@ -79,6 +79,15 @@ impl Service {
         self.request("GET", "/notes", None)
     }
 
+    pub fn put_note(&self, id: &str, title: &str, body: &str) -> (u16, serde_json::Value) {
+        let payload = serde_json::json!({ "title": title, "body": body }).to_string();
+        self.request("PUT", &format!("/notes/{id}"), Some(&payload))
+    }
+
+    pub fn delete_note(&self, id: &str) -> (u16, serde_json::Value) {
+        self.request("DELETE", &format!("/notes/{id}"), None)
+    }
+
     /// A hand-rolled HTTP/1.1 client: this suite's only need for one is
     /// three requests against a process it spawned itself, and that does
     /// not earn a dependency the shipped service never needed.
