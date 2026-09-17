@@ -172,9 +172,15 @@ impl PostgresStore {
             .await
             .map_err(|err| StoreError(format!("locking for migrations: {err}")))?;
 
-        let migrated = client
-            .batch_execute(include_str!("../../migrations/0001_create_notes.sql"))
-            .await;
+        let migrated = async {
+            client
+                .batch_execute(include_str!("../../migrations/0001_create_notes.sql"))
+                .await?;
+            client
+                .batch_execute(include_str!("../../migrations/0002_add_updated_at.sql"))
+                .await
+        }
+        .await;
 
         client
             .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_KEY])
