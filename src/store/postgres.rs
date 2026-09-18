@@ -6,7 +6,7 @@ use tokio_postgres::{Client, NoTls, Row};
 use uuid::Uuid;
 
 use crate::note::Note;
-use crate::store::{Store, StoreError};
+use crate::store::{ListQuery, Store, StoreError};
 
 /// An arbitrary, fixed key for the advisory lock that serializes migrations:
 /// `CREATE TABLE IF NOT EXISTS` is not actually safe against two connections
@@ -233,13 +233,21 @@ impl Store for PostgresStore {
         Ok(row.map(Note::from))
     }
 
-    fn list(&self) -> Result<Vec<Note>, StoreError> {
+    fn list(&self, query: &ListQuery) -> Result<Vec<Note>, StoreError> {
+        // The filter is applied here, in Rust, once every row has already
+        // crossed the socket: correct, and provable without a database, but
+        // not yet the job SQL itself should be doing — that pushdown is a
+        // later lot's, not this one's.
         let rows = self.conn.query(
             "SELECT id, title, body, created_at, updated_at FROM notes ORDER BY seq DESC",
             &[],
         )?;
 
-        Ok(rows.into_iter().map(Note::from).collect())
+        Ok(rows
+            .into_iter()
+            .map(Note::from)
+            .filter(|note| query.matches(note))
+            .collect())
     }
 
     fn update(&self, id: Uuid, title: String, body: String) -> Result<Option<Note>, StoreError> {
@@ -454,7 +462,7 @@ mod tests {
             ..Default::default()
         });
 
-        let notes = store.list().unwrap();
+        let notes = store.list(&ListQuery::default()).unwrap();
 
         assert_eq!(notes, vec![Note::from(first), Note::from(second)]);
     }
@@ -466,7 +474,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(store.list().unwrap(), vec![]);
+        assert_eq!(store.list(&ListQuery::default()).unwrap(), vec![]);
     }
 
     #[test]
@@ -478,7 +486,7 @@ mod tests {
             ..Default::default()
         });
 
-        store.list().unwrap();
+        store.list(&ListQuery::default()).unwrap();
 
         let (statement, params) = calls.last();
         assert!(statement.contains("SELECT"));
@@ -492,7 +500,94 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(store.list().unwrap_err().to_string(), "connection reset");
+        assert_eq!(
+            store.list(&ListQuery::default()).unwrap_err().to_string(),
+            "connection reset"
+        );
+    }
+
+    fn some_row_titled(id: Uuid, title: &str, body: &str) -> NoteRow {
+        NoteRow {
+            id,
+            title: title.to_string(),
+            body: body.to_string(),
+            created_at: some_time(1),
+            updated_at: some_time(1),
+        }
+    }
+
+    #[test]
+    fn list_filters_the_rows_the_connection_hands_back_by_q() {
+        let groceries = some_row_titled(Uuid::new_v4(), "groceries", "milk, eggs");
+        let taxes = some_row_titled(Uuid::new_v4(), "taxes", "file by april");
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![groceries.clone(), taxes])),
+            ..Default::default()
+        });
+
+        let notes = store
+            .list(&ListQuery {
+                q: Some("groc".to_string()),
+            })
+            .unwrap();
+
+        assert_eq!(notes, vec![Note::from(groceries)]);
+    }
+
+    #[test]
+    fn list_filters_case_insensitively_over_title_and_body() {
+        let groceries = some_row_titled(Uuid::new_v4(), "Groceries", "Milk, Eggs");
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![groceries.clone()])),
+            ..Default::default()
+        });
+
+        let notes = store
+            .list(&ListQuery {
+                q: Some("EGGS".to_string()),
+            })
+            .unwrap();
+
+        assert_eq!(notes, vec![Note::from(groceries)]);
+    }
+
+    #[test]
+    fn list_with_a_query_matching_nothing_is_empty() {
+        let groceries = some_row_titled(Uuid::new_v4(), "groceries", "milk, eggs");
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![groceries])),
+            ..Default::default()
+        });
+
+        let notes = store
+            .list(&ListQuery {
+                q: Some("bread".to_string()),
+            })
+            .unwrap();
+
+        assert_eq!(notes, vec![]);
+    }
+
+    /// This lot filters in Rust, after every row has already crossed the
+    /// socket: pushing `q` into the statement itself — and needing a
+    /// parameter for it — is a later lot's job, not this one's.
+    #[test]
+    fn list_with_a_query_still_sends_no_parameters_to_the_connection() {
+        let calls = CallLog::default();
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![])),
+            calls: calls.clone(),
+            ..Default::default()
+        });
+
+        store
+            .list(&ListQuery {
+                q: Some("groc".to_string()),
+            })
+            .unwrap();
+
+        let (_, params) = calls.last();
+        assert_eq!(params, vec![]);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::note::Note;
-use crate::store::{Store, StoreError};
+use crate::store::{ListQuery, Store, StoreError};
 
 /// Keeps notes in memory, in the order they were created. Nothing here
 /// survives the process — it exists for tests and for a service run without
@@ -49,13 +49,18 @@ impl Store for MemoryStore {
         Ok(notes.iter().find(|note| note.id == id).cloned())
     }
 
-    fn list(&self) -> Result<Vec<Note>, StoreError> {
+    fn list(&self, query: &ListQuery) -> Result<Vec<Note>, StoreError> {
         let notes = self
             .notes
             .lock()
             .map_err(|_| StoreError("the store's lock was poisoned".to_string()))?;
 
-        Ok(notes.iter().rev().cloned().collect())
+        Ok(notes
+            .iter()
+            .rev()
+            .filter(|note| query.matches(note))
+            .cloned()
+            .collect())
     }
 
     fn update(&self, id: Uuid, title: String, body: String) -> Result<Option<Note>, StoreError> {
@@ -152,7 +157,7 @@ mod tests {
     fn list_is_empty_for_a_fresh_store() {
         let store = MemoryStore::new();
 
-        let notes = store.list().unwrap();
+        let notes = store.list(&ListQuery::default()).unwrap();
 
         assert_eq!(notes, Vec::new());
     }
@@ -163,7 +168,7 @@ mod tests {
         store.create("a".to_string(), "a".to_string()).unwrap();
         store.create("b".to_string(), "b".to_string()).unwrap();
 
-        let notes = store.list().unwrap();
+        let notes = store.list(&ListQuery::default()).unwrap();
 
         assert_eq!(notes.len(), 2);
     }
@@ -175,7 +180,7 @@ mod tests {
         let second = store.create("second".to_string(), "2".to_string()).unwrap();
         let third = store.create("third".to_string(), "3".to_string()).unwrap();
 
-        let notes = store.list().unwrap();
+        let notes = store.list(&ListQuery::default()).unwrap();
 
         assert_eq!(notes, vec![third, second, first]);
     }
@@ -283,7 +288,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let notes = store.list().unwrap();
+        let notes = store.list(&ListQuery::default()).unwrap();
 
         assert_eq!(notes, vec![third, second, first]);
     }
@@ -326,6 +331,74 @@ mod tests {
 
         store.delete(first.id).unwrap();
 
-        assert_eq!(store.list().unwrap(), vec![second]);
+        assert_eq!(store.list(&ListQuery::default()).unwrap(), vec![second]);
+    }
+
+    fn query(q: &str) -> ListQuery {
+        ListQuery {
+            q: Some(q.to_string()),
+        }
+    }
+
+    #[test]
+    fn list_with_a_query_returns_only_the_notes_that_match_it() {
+        let store = MemoryStore::new();
+        store
+            .create("groceries".to_string(), "milk, eggs".to_string())
+            .unwrap();
+        store
+            .create("taxes".to_string(), "file by april".to_string())
+            .unwrap();
+
+        let notes = store.list(&query("groc")).unwrap();
+
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "groceries");
+    }
+
+    #[test]
+    fn list_with_a_query_matches_the_body_too() {
+        let store = MemoryStore::new();
+        store
+            .create("groceries".to_string(), "milk, eggs".to_string())
+            .unwrap();
+        store
+            .create("taxes".to_string(), "file by april".to_string())
+            .unwrap();
+
+        let notes = store.list(&query("eggs")).unwrap();
+
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "groceries");
+    }
+
+    #[test]
+    fn list_with_a_query_matching_nothing_is_empty() {
+        let store = MemoryStore::new();
+        store
+            .create("groceries".to_string(), "milk, eggs".to_string())
+            .unwrap();
+
+        let notes = store.list(&query("bread")).unwrap();
+
+        assert_eq!(notes, Vec::new());
+    }
+
+    #[test]
+    fn list_still_orders_matching_notes_newest_first() {
+        let store = MemoryStore::new();
+        let first = store
+            .create("first note".to_string(), "1".to_string())
+            .unwrap();
+        let second = store
+            .create("second note".to_string(), "2".to_string())
+            .unwrap();
+        let third = store
+            .create("third note".to_string(), "3".to_string())
+            .unwrap();
+
+        let notes = store.list(&query("note")).unwrap();
+
+        assert_eq!(notes, vec![third, second, first]);
     }
 }
