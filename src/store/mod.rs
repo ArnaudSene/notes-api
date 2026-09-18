@@ -30,14 +30,28 @@ pub trait Store: Send + Sync {
     fn delete(&self, id: Uuid) -> Result<bool, StoreError>;
 }
 
+/// The most a single listing will ever hand back, whatever a caller asks
+/// for: the ceiling is the service's to set, not the caller's — a `limit`
+/// with no cap would let a caller ask the service to build everything it
+/// holds in one response. Also what a listing returns when the caller
+/// gives no `limit` at all: "as many as you'd give me by default" is this
+/// many, not "everything".
+pub const MAX_LIMIT: u32 = 100;
+
 /// What a listing narrows itself to. Behind the trait, so a caller — the
-/// API layer today — never has to know whether a `Store` filters in Rust or
-/// pushes the filter down into a query of its own.
+/// API layer today — never has to know whether a `Store` filters and windows
+/// in Rust or pushes both down into a query of its own.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ListQuery {
     /// A case-insensitive substring that a note's title or body must
     /// contain. `None`, or `Some(String::new())`, means every note.
     pub q: Option<String>,
+    /// The most notes to hand back. `None`, or anything above
+    /// [`MAX_LIMIT`], is the same as `Some(MAX_LIMIT)`.
+    pub limit: Option<u32>,
+    /// How many matching notes, in order, to skip before the window
+    /// starts. `None` is the same as `Some(0)`.
+    pub offset: Option<u32>,
 }
 
 impl ListQuery {
@@ -52,6 +66,25 @@ impl ListQuery {
 
         let q = q.to_lowercase();
         note.title.to_lowercase().contains(&q) || note.body.to_lowercase().contains(&q)
+    }
+
+    /// The limit this query actually applies: the caller's, clamped to
+    /// [`MAX_LIMIT`], or `MAX_LIMIT` itself when the caller gave none.
+    fn effective_limit(&self) -> u32 {
+        self.limit.map_or(MAX_LIMIT, |limit| limit.min(MAX_LIMIT))
+    }
+
+    /// The one definition of "the window `limit`/`offset` describe": skip
+    /// `offset` notes, then take at most [`Self::effective_limit`]. Callers
+    /// give it notes already filtered and in their final order — a store
+    /// applies this last, exactly once, so a memory store and a SQL one
+    /// page through the same order the same way.
+    pub fn window(&self, notes: Vec<Note>) -> Vec<Note> {
+        notes
+            .into_iter()
+            .skip(self.offset.unwrap_or(0) as usize)
+            .take(self.effective_limit() as usize)
+            .collect()
     }
 }
 
@@ -81,6 +114,7 @@ mod tests {
     fn query(q: &str) -> ListQuery {
         ListQuery {
             q: Some(q.to_string()),
+            ..Default::default()
         }
     }
 
@@ -128,5 +162,116 @@ mod tests {
         let title = "'; drop table notes; --";
         assert!(query("drop table").matches(&note(title, "")));
         assert!(query(title).matches(&note(title, "")));
+    }
+
+    /// `count` notes, titled `"note 0"` through `"note {count - 1}"`, in
+    /// that order — the order a store's own logic hands `window` once
+    /// filtering and ordering are already done.
+    fn notes(count: u32) -> Vec<Note> {
+        (0..count).map(|i| note(&format!("note {i}"), "")).collect()
+    }
+
+    fn titles(notes: &[Note]) -> Vec<&str> {
+        notes.iter().map(|note| note.title.as_str()).collect()
+    }
+
+    #[test]
+    fn window_with_no_limit_or_offset_returns_everything_under_the_ceiling() {
+        let query = ListQuery::default();
+
+        assert_eq!(query.window(notes(3)).len(), 3);
+    }
+
+    #[test]
+    fn window_with_no_limit_is_bounded_by_max_limit() {
+        let query = ListQuery::default();
+
+        let windowed = query.window(notes(MAX_LIMIT + 1));
+
+        assert_eq!(windowed.len(), MAX_LIMIT as usize);
+    }
+
+    #[test]
+    fn window_honors_a_limit_within_the_ceiling() {
+        let query = ListQuery {
+            limit: Some(2),
+            ..Default::default()
+        };
+
+        assert_eq!(titles(&query.window(notes(5))), vec!["note 0", "note 1"]);
+    }
+
+    #[test]
+    fn window_clamps_a_limit_above_the_ceiling_down_to_it() {
+        let query = ListQuery {
+            limit: Some(MAX_LIMIT + 50),
+            ..Default::default()
+        };
+
+        let windowed = query.window(notes(MAX_LIMIT + 1));
+
+        assert_eq!(windowed.len(), MAX_LIMIT as usize);
+    }
+
+    #[test]
+    fn window_defaults_offset_to_zero() {
+        let query = ListQuery {
+            limit: Some(1),
+            ..Default::default()
+        };
+
+        assert_eq!(titles(&query.window(notes(3))), vec!["note 0"]);
+    }
+
+    #[test]
+    fn window_skips_offset_notes_before_taking_the_limit() {
+        let query = ListQuery {
+            limit: Some(2),
+            offset: Some(2),
+            ..Default::default()
+        };
+
+        assert_eq!(titles(&query.window(notes(5))), vec!["note 2", "note 3"]);
+    }
+
+    #[test]
+    fn window_with_an_offset_past_the_end_is_empty() {
+        let query = ListQuery {
+            offset: Some(10),
+            ..Default::default()
+        };
+
+        assert_eq!(query.window(notes(3)), Vec::new());
+    }
+
+    #[test]
+    fn window_with_a_limit_of_zero_is_empty() {
+        let query = ListQuery {
+            limit: Some(0),
+            ..Default::default()
+        };
+
+        assert_eq!(query.window(notes(3)), Vec::new());
+    }
+
+    /// The order `window` pages over is total (every note has its own,
+    /// distinct place), so paging over it with a fixed limit, one offset
+    /// after another, has to reconstruct the original sequence exactly:
+    /// nothing skipped, nothing repeated.
+    #[test]
+    fn paging_by_a_fixed_limit_covers_every_note_exactly_once_and_in_order() {
+        let source = notes(5);
+
+        let mut paged = Vec::new();
+        for offset in [0, 2, 4] {
+            let query = ListQuery {
+                limit: Some(2),
+                offset: Some(offset),
+                ..Default::default()
+            };
+            paged.extend(query.window(source.clone()));
+        }
+
+        assert_eq!(paged, source);
     }
 }

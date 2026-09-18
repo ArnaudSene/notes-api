@@ -114,6 +114,8 @@ async fn delete_note(State(state): State<AppState>, Path(id): Path<String>) -> R
 async fn list_notes(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> Response {
     let query = ListQuery {
         q: q_param(raw_query.as_deref()),
+        limit: numeric_param(raw_query.as_deref(), "limit"),
+        offset: numeric_param(raw_query.as_deref(), "offset"),
     };
 
     match state.store.list(&query) {
@@ -122,18 +124,33 @@ async fn list_notes(State(state): State<AppState>, RawQuery(raw_query): RawQuery
     }
 }
 
+/// The raw, still percent-encoded value of `key` in a raw query string, or
+/// `None` when the string is absent or carries no pair for `key`. The one
+/// place both `q_param` and `numeric_param` split `k=v&k2=v2` apart, so
+/// that stays defined once.
+fn raw_param<'a>(raw_query: Option<&'a str>, key: &str) -> Option<&'a str> {
+    raw_query?
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, value)| value)
+}
+
 /// The `q` parameter out of a raw query string, percent-decoded, or `None`
 /// when it is absent or decodes to an empty string. `axum`'s `Query`
 /// extractor would pull in `serde_urlencoded` for this; one parameter is
 /// not worth that dependency, so it is read by hand instead.
 fn q_param(raw_query: Option<&str>) -> Option<String> {
-    let value = raw_query?
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(key, _)| *key == "q")
-        .map(|(_, value)| percent_decode(value))?;
+    let value = percent_decode(raw_param(raw_query, "q")?);
 
     if value.is_empty() { None } else { Some(value) }
+}
+
+/// `key`'s value, parsed as a non-negative integer, or `None` when it is
+/// absent or is not one — malformed input falls back to the service's
+/// default for `limit`/`offset` rather than rejecting the request.
+fn numeric_param(raw_query: Option<&str>, key: &str) -> Option<u32> {
+    raw_param(raw_query, key)?.parse().ok()
 }
 
 /// Decodes `+` as a space and a `%XX` escape as the byte it encodes. A `%`
@@ -554,6 +571,82 @@ mod tests {
             .await
             .unwrap();
 
+        let notes = body_json(response).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_notes_with_a_limit_returns_only_that_many() {
+        let app = app();
+        app.clone().oneshot(create_request("a", "")).await.unwrap();
+        app.clone().oneshot(create_request("b", "")).await.unwrap();
+        app.clone().oneshot(create_request("c", "")).await.unwrap();
+
+        let response = app.oneshot(list_request("limit=2")).await.unwrap();
+
+        let notes = body_json(response).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_notes_with_an_offset_skips_that_many() {
+        let app = app();
+        app.clone()
+            .oneshot(create_request("first", ""))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(create_request("second", ""))
+            .await
+            .unwrap();
+
+        // Newest first: second, first. Skipping 1 leaves only "first".
+        let response = app.oneshot(list_request("offset=1")).await.unwrap();
+
+        let notes = body_json(response).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["title"], "first");
+    }
+
+    #[tokio::test]
+    async fn get_notes_pages_through_with_limit_and_offset_together() {
+        let app = app();
+        app.clone()
+            .oneshot(create_request("first", ""))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(create_request("second", ""))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(create_request("third", ""))
+            .await
+            .unwrap();
+
+        // Newest first: third, second, first. limit=1&offset=1 -> second.
+        let response = app.oneshot(list_request("limit=1&offset=1")).await.unwrap();
+
+        let notes = body_json(response).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["title"], "second");
+    }
+
+    #[tokio::test]
+    async fn get_notes_with_a_malformed_limit_falls_back_to_the_default() {
+        let app = app();
+        app.clone().oneshot(create_request("a", "")).await.unwrap();
+
+        let response = app
+            .oneshot(list_request("limit=not-a-number"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
         let notes = body_json(response).await;
         let notes = notes.as_array().unwrap();
         assert_eq!(notes.len(), 1);
@@ -1009,6 +1102,37 @@ mod tests {
             q_param(Some("q=milk%20and%20eggs")),
             Some("milk and eggs".to_string())
         );
+    }
+
+    #[test]
+    fn numeric_param_reads_the_pair_it_is_asked_for() {
+        assert_eq!(numeric_param(Some("limit=10"), "limit"), Some(10));
+        assert_eq!(numeric_param(Some("offset=5"), "offset"), Some(5));
+    }
+
+    #[test]
+    fn numeric_param_is_none_when_there_is_no_query_string() {
+        assert_eq!(numeric_param(None, "limit"), None);
+    }
+
+    #[test]
+    fn numeric_param_is_none_when_the_key_is_absent() {
+        assert_eq!(numeric_param(Some("q=milk"), "limit"), None);
+    }
+
+    #[test]
+    fn numeric_param_is_none_when_the_value_is_not_a_number() {
+        assert_eq!(numeric_param(Some("limit=ten"), "limit"), None);
+    }
+
+    #[test]
+    fn numeric_param_is_none_when_the_value_is_negative() {
+        assert_eq!(numeric_param(Some("limit=-1"), "limit"), None);
+    }
+
+    #[test]
+    fn numeric_param_ignores_other_parameters() {
+        assert_eq!(numeric_param(Some("q=milk&limit=10"), "limit"), Some(10));
     }
 
     #[test]

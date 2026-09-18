@@ -234,20 +234,22 @@ impl Store for PostgresStore {
     }
 
     fn list(&self, query: &ListQuery) -> Result<Vec<Note>, StoreError> {
-        // The filter is applied here, in Rust, once every row has already
-        // crossed the socket: correct, and provable without a database, but
-        // not yet the job SQL itself should be doing — that pushdown is a
-        // later lot's, not this one's.
+        // The filter and the window are both applied here, in Rust, once
+        // every row has already crossed the socket: correct, and provable
+        // without a database, but not yet the job SQL itself should be
+        // doing — that pushdown is a later lot's, not this one's.
         let rows = self.conn.query(
             "SELECT id, title, body, created_at, updated_at FROM notes ORDER BY seq DESC",
             &[],
         )?;
 
-        Ok(rows
+        let matched: Vec<Note> = rows
             .into_iter()
             .map(Note::from)
             .filter(|note| query.matches(note))
-            .collect())
+            .collect();
+
+        Ok(query.window(matched))
     }
 
     fn update(&self, id: Uuid, title: String, body: String) -> Result<Option<Note>, StoreError> {
@@ -528,6 +530,7 @@ mod tests {
         let notes = store
             .list(&ListQuery {
                 q: Some("groc".to_string()),
+                ..Default::default()
             })
             .unwrap();
 
@@ -545,6 +548,7 @@ mod tests {
         let notes = store
             .list(&ListQuery {
                 q: Some("EGGS".to_string()),
+                ..Default::default()
             })
             .unwrap();
 
@@ -562,6 +566,7 @@ mod tests {
         let notes = store
             .list(&ListQuery {
                 q: Some("bread".to_string()),
+                ..Default::default()
             })
             .unwrap();
 
@@ -583,6 +588,115 @@ mod tests {
         store
             .list(&ListQuery {
                 q: Some("groc".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let (_, params) = calls.last();
+        assert_eq!(params, vec![]);
+    }
+
+    #[test]
+    fn list_with_a_limit_returns_only_that_many_rows() {
+        let rows = vec![
+            some_row_titled(Uuid::new_v4(), "a", ""),
+            some_row_titled(Uuid::new_v4(), "b", ""),
+            some_row_titled(Uuid::new_v4(), "c", ""),
+        ];
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(rows)),
+            ..Default::default()
+        });
+
+        let notes = store
+            .list(&ListQuery {
+                limit: Some(2),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(notes.len(), 2);
+    }
+
+    #[test]
+    fn list_with_an_offset_skips_that_many_rows() {
+        let a = some_row_titled(Uuid::new_v4(), "a", "");
+        let b = some_row_titled(Uuid::new_v4(), "b", "");
+        let c = some_row_titled(Uuid::new_v4(), "c", "");
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![a, b.clone(), c.clone()])),
+            ..Default::default()
+        });
+
+        let notes = store
+            .list(&ListQuery {
+                offset: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(notes, vec![Note::from(b), Note::from(c)]);
+    }
+
+    #[test]
+    fn list_without_a_limit_is_bounded_by_the_service_default() {
+        let rows: Vec<NoteRow> = (0..(crate::store::MAX_LIMIT + 1))
+            .map(|i| some_row_titled(Uuid::new_v4(), &format!("note {i}"), ""))
+            .collect();
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(rows)),
+            ..Default::default()
+        });
+
+        let notes = store.list(&ListQuery::default()).unwrap();
+
+        assert_eq!(notes.len(), crate::store::MAX_LIMIT as usize);
+    }
+
+    #[test]
+    fn list_windows_the_rows_that_matched_the_query_not_everything() {
+        // The order the connection hands rows back in is already final
+        // (`SELECT ... ORDER BY seq DESC`, newest first): `taxes` is
+        // newest, but it does not match `q`. Windowing before filtering
+        // would take `taxes` for a limit of 1 and then filter it away,
+        // leaving nothing; filtering first leaves `groceries_again` for the
+        // window to take.
+        let taxes = some_row_titled(Uuid::new_v4(), "taxes", "file by april");
+        let groceries_again = some_row_titled(Uuid::new_v4(), "groceries again", "eggs");
+        let groceries = some_row_titled(Uuid::new_v4(), "groceries", "milk");
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![taxes, groceries_again.clone(), groceries])),
+            ..Default::default()
+        });
+
+        let notes = store
+            .list(&ListQuery {
+                q: Some("groceries".to_string()),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(notes, vec![Note::from(groceries_again)]);
+    }
+
+    /// This lot windows in Rust, after every row has already crossed the
+    /// socket: pushing `limit`/`offset` into the statement itself is a
+    /// later lot's job, not this one's.
+    #[test]
+    fn list_with_a_limit_and_offset_still_sends_no_parameters_to_the_connection() {
+        let calls = CallLog::default();
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![])),
+            calls: calls.clone(),
+            ..Default::default()
+        });
+
+        store
+            .list(&ListQuery {
+                limit: Some(2),
+                offset: Some(1),
+                ..Default::default()
             })
             .unwrap();
 
