@@ -16,14 +16,17 @@ use crate::store::{ListQuery, Store, StoreError};
 /// freshly-lifted database will do.
 const MIGRATION_LOCK_KEY: i64 = 0x6e6f7465732d6462u64 as i64;
 
-/// A query parameter, in the only three shapes a note's columns ever need.
-/// Unlike `&(dyn ToSql + Sync)`, a unit test can build one of these without
-/// a driver in sight.
+/// A query parameter, in the only shapes a note's columns — and now `list`'s
+/// `LIMIT`/`OFFSET` — ever need. Unlike `&(dyn ToSql + Sync)`, a unit test
+/// can build one of these without a driver in sight.
 #[derive(Debug, Clone, PartialEq)]
 enum Param {
     Uuid(Uuid),
     Text(String),
     Timestamp(DateTime<Utc>),
+    /// `LIMIT`/`OFFSET`: `BIGINT`, to match `seq`, the column they page
+    /// over.
+    Int8(i64),
 }
 
 impl Param {
@@ -32,6 +35,7 @@ impl Param {
             Param::Uuid(value) => value,
             Param::Text(value) => value,
             Param::Timestamp(value) => value,
+            Param::Int8(value) => value,
         }
     }
 }
@@ -234,22 +238,32 @@ impl Store for PostgresStore {
     }
 
     fn list(&self, query: &ListQuery) -> Result<Vec<Note>, StoreError> {
-        // The filter and the window are both applied here, in Rust, once
-        // every row has already crossed the socket: correct, and provable
-        // without a database, but not yet the job SQL itself should be
-        // doing — that pushdown is a later lot's, not this one's.
+        // The filter and the window are both SQL's job now: `$1` is
+        // `ListQuery::like_pattern`, a bound parameter — never text spliced
+        // into the statement — so a title or body containing `'; drop
+        // table notes; --` is a row this still matches on its own terms,
+        // not SQL this runs. `$2`/`$3` are `effective_limit`/
+        // `effective_offset`, the same numbers `ListQuery::window` would
+        // apply in Rust for `MemoryStore`.
+        //
+        // This query wants an index this lot cannot add — migrations are
+        // the integrator's (see JOURNAL.md/PR.md): a trigram (`pg_trgm`
+        // `gin`) index on `title`/`body` for the two `ILIKE`s, and a btree
+        // index on `seq` for `ORDER BY ... LIMIT ... OFFSET` (`BIGSERIAL`
+        // only guarantees a sequence, not an index).
         let rows = self.conn.query(
-            "SELECT id, title, body, created_at, updated_at FROM notes ORDER BY seq DESC",
-            &[],
+            "SELECT id, title, body, created_at, updated_at FROM notes \
+             WHERE title ILIKE $1 OR body ILIKE $1 \
+             ORDER BY seq DESC \
+             LIMIT $2 OFFSET $3",
+            &[
+                Param::Text(query.like_pattern()),
+                Param::Int8(query.effective_limit() as i64),
+                Param::Int8(query.effective_offset() as i64),
+            ],
         )?;
 
-        let matched: Vec<Note> = rows
-            .into_iter()
-            .map(Note::from)
-            .filter(|note| query.matches(note))
-            .collect();
-
-        Ok(query.window(matched))
+        Ok(rows.into_iter().map(Note::from).collect())
     }
 
     fn update(&self, id: Uuid, title: String, body: String) -> Result<Option<Note>, StoreError> {
@@ -480,22 +494,6 @@ mod tests {
     }
 
     #[test]
-    fn list_sends_no_parameters() {
-        let calls = CallLog::default();
-        let store = store_on(StubConnection {
-            query_result: Some(Ok(vec![])),
-            calls: calls.clone(),
-            ..Default::default()
-        });
-
-        store.list(&ListQuery::default()).unwrap();
-
-        let (statement, params) = calls.last();
-        assert!(statement.contains("SELECT"));
-        assert_eq!(params, vec![]);
-    }
-
-    #[test]
     fn list_propagates_a_driver_error() {
         let store = store_on(StubConnection {
             query_result: Some(Err(StoreError("connection reset".to_string()))),
@@ -508,76 +506,16 @@ mod tests {
         );
     }
 
-    fn some_row_titled(id: Uuid, title: &str, body: &str) -> NoteRow {
-        NoteRow {
-            id,
-            title: title.to_string(),
-            body: body.to_string(),
-            created_at: some_time(1),
-            updated_at: some_time(1),
-        }
-    }
-
+    /// The statement's fixed shape: a `WHERE` on both columns, `ILIKE` (not
+    /// `LIKE`, which is case-sensitive) so the SQL answers the same
+    /// case-insensitivity question `ListQuery::matches` does for
+    /// `MemoryStore`, an unchanged `ORDER BY seq DESC`, and a `LIMIT`/
+    /// `OFFSET` that reads from `$2`/`$3` — never a number formatted
+    /// straight into the text, which
+    /// `list_sends_the_effective_limit_and_offset_as_bound_parameters`
+    /// below also pins down from the parameters side.
     #[test]
-    fn list_filters_the_rows_the_connection_hands_back_by_q() {
-        let groceries = some_row_titled(Uuid::new_v4(), "groceries", "milk, eggs");
-        let taxes = some_row_titled(Uuid::new_v4(), "taxes", "file by april");
-        let store = store_on(StubConnection {
-            query_result: Some(Ok(vec![groceries.clone(), taxes])),
-            ..Default::default()
-        });
-
-        let notes = store
-            .list(&ListQuery {
-                q: Some("groc".to_string()),
-                ..Default::default()
-            })
-            .unwrap();
-
-        assert_eq!(notes, vec![Note::from(groceries)]);
-    }
-
-    #[test]
-    fn list_filters_case_insensitively_over_title_and_body() {
-        let groceries = some_row_titled(Uuid::new_v4(), "Groceries", "Milk, Eggs");
-        let store = store_on(StubConnection {
-            query_result: Some(Ok(vec![groceries.clone()])),
-            ..Default::default()
-        });
-
-        let notes = store
-            .list(&ListQuery {
-                q: Some("EGGS".to_string()),
-                ..Default::default()
-            })
-            .unwrap();
-
-        assert_eq!(notes, vec![Note::from(groceries)]);
-    }
-
-    #[test]
-    fn list_with_a_query_matching_nothing_is_empty() {
-        let groceries = some_row_titled(Uuid::new_v4(), "groceries", "milk, eggs");
-        let store = store_on(StubConnection {
-            query_result: Some(Ok(vec![groceries])),
-            ..Default::default()
-        });
-
-        let notes = store
-            .list(&ListQuery {
-                q: Some("bread".to_string()),
-                ..Default::default()
-            })
-            .unwrap();
-
-        assert_eq!(notes, vec![]);
-    }
-
-    /// This lot filters in Rust, after every row has already crossed the
-    /// socket: pushing `q` into the statement itself — and needing a
-    /// parameter for it — is a later lot's job, not this one's.
-    #[test]
-    fn list_with_a_query_still_sends_no_parameters_to_the_connection() {
+    fn list_sends_a_statement_with_ilike_and_a_bound_limit_and_offset() {
         let calls = CallLog::default();
         let store = store_on(StubConnection {
             query_result: Some(Ok(vec![])),
@@ -585,106 +523,52 @@ mod tests {
             ..Default::default()
         });
 
-        store
-            .list(&ListQuery {
-                q: Some("groc".to_string()),
-                ..Default::default()
-            })
-            .unwrap();
+        store.list(&ListQuery::default()).unwrap();
+
+        let (statement, _) = calls.last();
+        assert!(statement.contains("SELECT"));
+        assert!(statement.contains("WHERE title ILIKE $1 OR body ILIKE $1"));
+        assert!(statement.contains("ORDER BY seq DESC"));
+        assert!(statement.contains("LIMIT $2 OFFSET $3"));
+    }
+
+    #[test]
+    fn list_sends_the_like_pattern_as_its_first_parameter() {
+        let calls = CallLog::default();
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![])),
+            calls: calls.clone(),
+            ..Default::default()
+        });
+        let query = ListQuery {
+            q: Some("groc".to_string()),
+            ..Default::default()
+        };
+
+        store.list(&query).unwrap();
 
         let (_, params) = calls.last();
-        assert_eq!(params, vec![]);
+        assert_eq!(params[0], Param::Text(query.like_pattern()));
+        assert_eq!(params[0], Param::Text("%groc%".to_string()));
     }
 
     #[test]
-    fn list_with_a_limit_returns_only_that_many_rows() {
-        let rows = vec![
-            some_row_titled(Uuid::new_v4(), "a", ""),
-            some_row_titled(Uuid::new_v4(), "b", ""),
-            some_row_titled(Uuid::new_v4(), "c", ""),
-        ];
+    fn list_sends_a_bare_wildcard_pattern_when_there_is_no_q() {
+        let calls = CallLog::default();
         let store = store_on(StubConnection {
-            query_result: Some(Ok(rows)),
+            query_result: Some(Ok(vec![])),
+            calls: calls.clone(),
             ..Default::default()
         });
 
-        let notes = store
-            .list(&ListQuery {
-                limit: Some(2),
-                ..Default::default()
-            })
-            .unwrap();
+        store.list(&ListQuery::default()).unwrap();
 
-        assert_eq!(notes.len(), 2);
+        let (_, params) = calls.last();
+        assert_eq!(params[0], Param::Text("%%".to_string()));
     }
 
     #[test]
-    fn list_with_an_offset_skips_that_many_rows() {
-        let a = some_row_titled(Uuid::new_v4(), "a", "");
-        let b = some_row_titled(Uuid::new_v4(), "b", "");
-        let c = some_row_titled(Uuid::new_v4(), "c", "");
-        let store = store_on(StubConnection {
-            query_result: Some(Ok(vec![a, b.clone(), c.clone()])),
-            ..Default::default()
-        });
-
-        let notes = store
-            .list(&ListQuery {
-                offset: Some(1),
-                ..Default::default()
-            })
-            .unwrap();
-
-        assert_eq!(notes, vec![Note::from(b), Note::from(c)]);
-    }
-
-    #[test]
-    fn list_without_a_limit_is_bounded_by_the_service_default() {
-        let rows: Vec<NoteRow> = (0..(crate::store::MAX_LIMIT + 1))
-            .map(|i| some_row_titled(Uuid::new_v4(), &format!("note {i}"), ""))
-            .collect();
-        let store = store_on(StubConnection {
-            query_result: Some(Ok(rows)),
-            ..Default::default()
-        });
-
-        let notes = store.list(&ListQuery::default()).unwrap();
-
-        assert_eq!(notes.len(), crate::store::MAX_LIMIT as usize);
-    }
-
-    #[test]
-    fn list_windows_the_rows_that_matched_the_query_not_everything() {
-        // The order the connection hands rows back in is already final
-        // (`SELECT ... ORDER BY seq DESC`, newest first): `taxes` is
-        // newest, but it does not match `q`. Windowing before filtering
-        // would take `taxes` for a limit of 1 and then filter it away,
-        // leaving nothing; filtering first leaves `groceries_again` for the
-        // window to take.
-        let taxes = some_row_titled(Uuid::new_v4(), "taxes", "file by april");
-        let groceries_again = some_row_titled(Uuid::new_v4(), "groceries again", "eggs");
-        let groceries = some_row_titled(Uuid::new_v4(), "groceries", "milk");
-        let store = store_on(StubConnection {
-            query_result: Some(Ok(vec![taxes, groceries_again.clone(), groceries])),
-            ..Default::default()
-        });
-
-        let notes = store
-            .list(&ListQuery {
-                q: Some("groceries".to_string()),
-                limit: Some(1),
-                ..Default::default()
-            })
-            .unwrap();
-
-        assert_eq!(notes, vec![Note::from(groceries_again)]);
-    }
-
-    /// This lot windows in Rust, after every row has already crossed the
-    /// socket: pushing `limit`/`offset` into the statement itself is a
-    /// later lot's job, not this one's.
-    #[test]
-    fn list_with_a_limit_and_offset_still_sends_no_parameters_to_the_connection() {
+    fn list_sends_the_effective_limit_and_offset_as_bound_parameters() {
         let calls = CallLog::default();
         let store = store_on(StubConnection {
             query_result: Some(Ok(vec![])),
@@ -695,13 +579,76 @@ mod tests {
         store
             .list(&ListQuery {
                 limit: Some(2),
-                offset: Some(1),
+                offset: Some(3),
                 ..Default::default()
             })
             .unwrap();
 
         let (_, params) = calls.last();
-        assert_eq!(params, vec![]);
+        assert_eq!(params[1], Param::Int8(2));
+        assert_eq!(params[2], Param::Int8(3));
+    }
+
+    #[test]
+    fn list_sends_max_limit_and_zero_offset_when_the_caller_gives_neither() {
+        let calls = CallLog::default();
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![])),
+            calls: calls.clone(),
+            ..Default::default()
+        });
+
+        store.list(&ListQuery::default()).unwrap();
+
+        let (_, params) = calls.last();
+        assert_eq!(params[1], Param::Int8(crate::store::MAX_LIMIT as i64));
+        assert_eq!(params[2], Param::Int8(0));
+    }
+
+    #[test]
+    fn list_clamps_a_limit_above_the_ceiling_in_the_parameter_it_sends() {
+        let calls = CallLog::default();
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![])),
+            calls: calls.clone(),
+            ..Default::default()
+        });
+
+        store
+            .list(&ListQuery {
+                limit: Some(crate::store::MAX_LIMIT + 50),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let (_, params) = calls.last();
+        assert_eq!(params[1], Param::Int8(crate::store::MAX_LIMIT as i64));
+    }
+
+    /// The mission's own proof obligation for this lot: a title of `';
+    /// drop table notes; --` has to come back as a note, not run as SQL.
+    /// Since it only ever reaches the driver as a bound `Param::Text`
+    /// alongside a statement that is a fixed string, it cannot: nothing
+    /// here builds the statement by formatting `q` into it.
+    #[test]
+    fn list_sends_sql_looking_q_as_a_bound_parameter_not_statement_text() {
+        let calls = CallLog::default();
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![])),
+            calls: calls.clone(),
+            ..Default::default()
+        });
+        let dangerous = "'; drop table notes; --";
+        let query = ListQuery {
+            q: Some(dangerous.to_string()),
+            ..Default::default()
+        };
+
+        store.list(&query).unwrap();
+
+        let (statement, params) = calls.last();
+        assert!(!statement.contains(dangerous));
+        assert_eq!(params[0], Param::Text(format!("%{dangerous}%")));
     }
 
     #[test]

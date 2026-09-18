@@ -55,10 +55,12 @@ pub struct ListQuery {
 }
 
 impl ListQuery {
-    /// The one definition of "matches `q`". Every `Store` implementation
-    /// filters through this rather than writing its own comparison, so that
-    /// what counts as a match cannot drift between a memory store and a SQL
-    /// one answering the same query.
+    /// The one definition of "matches `q`": a case-insensitive substring
+    /// over title or body. `MemoryStore` filters through this directly.
+    /// `PostgresStore` expresses the same contract in SQL instead (see
+    /// [`Self::like_pattern`]) — the wording of what counts as a match
+    /// lives here, once, so the two cannot drift on what "matches" means
+    /// even though they check it two different ways.
     pub fn matches(&self, note: &Note) -> bool {
         let Some(q) = self.q.as_deref().filter(|q| !q.is_empty()) else {
             return true;
@@ -68,21 +70,46 @@ impl ListQuery {
         note.title.to_lowercase().contains(&q) || note.body.to_lowercase().contains(&q)
     }
 
+    /// [`Self::matches`], expressed as a SQL `LIKE`/`ILIKE` pattern instead
+    /// of a Rust substring search: `q` wrapped in `%` wildcards, with any
+    /// `%`, `_`, or `\` already in `q` escaped so that a literal one in a
+    /// title or body still counts as a literal one — not as a wildcard
+    /// `LIKE` would otherwise take it for. `None`, or an empty `q`, becomes
+    /// a bare wildcard that matches every row, the same way
+    /// [`Self::matches`] does.
+    pub fn like_pattern(&self) -> String {
+        let q = self.q.as_deref().unwrap_or("");
+        let escaped = q
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+
+        format!("%{escaped}%")
+    }
+
     /// The limit this query actually applies: the caller's, clamped to
     /// [`MAX_LIMIT`], or `MAX_LIMIT` itself when the caller gave none.
-    fn effective_limit(&self) -> u32 {
+    pub fn effective_limit(&self) -> u32 {
         self.limit.map_or(MAX_LIMIT, |limit| limit.min(MAX_LIMIT))
     }
 
+    /// The offset this query actually applies: the caller's, or `0` when
+    /// the caller gave none.
+    pub fn effective_offset(&self) -> u32 {
+        self.offset.unwrap_or(0)
+    }
+
     /// The one definition of "the window `limit`/`offset` describe": skip
-    /// `offset` notes, then take at most [`Self::effective_limit`]. Callers
-    /// give it notes already filtered and in their final order — a store
-    /// applies this last, exactly once, so a memory store and a SQL one
-    /// page through the same order the same way.
+    /// [`Self::effective_offset`] notes, then take at most
+    /// [`Self::effective_limit`]. `MemoryStore` calls this directly, on
+    /// notes it has already filtered and ordered. `PostgresStore`
+    /// expresses the same window as SQL `LIMIT`/`OFFSET` instead, built
+    /// from the same `effective_limit`/`effective_offset` this uses, so
+    /// this method itself goes unused there.
     pub fn window(&self, notes: Vec<Note>) -> Vec<Note> {
         notes
             .into_iter()
-            .skip(self.offset.unwrap_or(0) as usize)
+            .skip(self.effective_offset() as usize)
             .take(self.effective_limit() as usize)
             .collect()
     }
@@ -162,6 +189,63 @@ mod tests {
         let title = "'; drop table notes; --";
         assert!(query("drop table").matches(&note(title, "")));
         assert!(query(title).matches(&note(title, "")));
+    }
+
+    #[test]
+    fn like_pattern_wraps_q_in_wildcards() {
+        assert_eq!(query("milk").like_pattern(), "%milk%");
+    }
+
+    #[test]
+    fn like_pattern_matches_everything_when_there_is_no_q() {
+        // "%%" and "%" are equivalent LIKE patterns; either matches every
+        // row, including one with an empty title or body.
+        assert_eq!(ListQuery::default().like_pattern(), "%%");
+    }
+
+    #[test]
+    fn like_pattern_matches_everything_when_q_is_empty() {
+        assert_eq!(query("").like_pattern(), "%%");
+    }
+
+    #[test]
+    fn like_pattern_escapes_a_literal_percent() {
+        assert_eq!(query("50%").like_pattern(), "%50\\%%");
+    }
+
+    #[test]
+    fn like_pattern_escapes_a_literal_underscore() {
+        assert_eq!(query("a_b").like_pattern(), "%a\\_b%");
+    }
+
+    #[test]
+    fn like_pattern_escapes_a_literal_backslash() {
+        assert_eq!(query("a\\b").like_pattern(), "%a\\\\b%");
+    }
+
+    #[test]
+    fn like_pattern_keeps_sql_looking_text_as_literal_data() {
+        // `LIKE`'s only special characters are `%`, `_`, and the escape
+        // character; a quote or a semicolon needs no escaping to stay
+        // literal here, and — because this becomes a bound parameter, never
+        // text spliced into the statement — cannot act as SQL either.
+        let title = "'; drop table notes; --";
+        assert_eq!(query(title).like_pattern(), format!("%{title}%"));
+    }
+
+    #[test]
+    fn effective_offset_is_zero_when_the_caller_gives_none() {
+        assert_eq!(ListQuery::default().effective_offset(), 0);
+    }
+
+    #[test]
+    fn effective_offset_is_the_caller_s_offset_when_given() {
+        let query = ListQuery {
+            offset: Some(7),
+            ..Default::default()
+        };
+
+        assert_eq!(query.effective_offset(), 7);
     }
 
     /// `count` notes, titled `"note 0"` through `"note {count - 1}"`, in
