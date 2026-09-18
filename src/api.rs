@@ -1069,6 +1069,39 @@ mod tests {
     }
 
     #[test]
+    fn raw_param_reads_the_pair_it_is_asked_for() {
+        assert_eq!(raw_param(Some("q=milk"), "q"), Some("milk"));
+    }
+
+    #[test]
+    fn raw_param_is_none_when_there_is_no_query_string() {
+        assert_eq!(raw_param(None, "q"), None);
+    }
+
+    #[test]
+    fn raw_param_is_none_when_the_key_is_absent() {
+        assert_eq!(raw_param(Some("limit=10"), "q"), None);
+    }
+
+    #[test]
+    fn raw_param_ignores_other_parameters() {
+        assert_eq!(
+            raw_param(Some("limit=10&q=milk&offset=5"), "q"),
+            Some("milk")
+        );
+    }
+
+    #[test]
+    fn raw_param_does_not_decode_its_value() {
+        // Percent-decoding is `q_param`'s job, layered on top; `raw_param`
+        // itself hands back exactly the bytes between `=` and `&`.
+        assert_eq!(
+            raw_param(Some("q=milk%20and%20eggs"), "q"),
+            Some("milk%20and%20eggs")
+        );
+    }
+
+    #[test]
     fn q_param_reads_q_out_of_the_raw_query() {
         assert_eq!(q_param(Some("q=milk")), Some("milk".to_string()));
     }
