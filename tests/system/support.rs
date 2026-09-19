@@ -22,6 +22,30 @@ pub fn database_url() -> String {
         .unwrap_or_else(|_| "postgres://notes:notes-for-tests@db:5432/notes".to_string())
 }
 
+/// A token unlikely to appear in any note this suite did not just create:
+/// the database is never reset between runs (see `tests/system.rs`), so a
+/// query test needs its own marker to tell its notes apart from whatever a
+/// previous run left behind.
+pub fn unique_marker() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// Percent-encodes `value` for use in a raw query string built by hand: the
+/// server's own `percent_decode` (`src/api.rs`) only ever has to undo this.
+/// Everything outside `A-Za-z0-9-_.~` is escaped, `+` included, so a decoded
+/// value can never come back other than byte-for-byte what went in.
+pub fn encode_query_value(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
 /// The compiled service, running as its own process against the real
 /// database — the binary a deploy would run, not the router under test.
 /// Killed when dropped, so a test that fails early never leaves one bound
@@ -77,6 +101,14 @@ impl Service {
 
     pub fn list_notes(&self) -> (u16, serde_json::Value) {
         self.request("GET", "/notes", None)
+    }
+
+    /// `GET /notes` with a raw query string already assembled (e.g.
+    /// `"q=milk&limit=2"`) — a test builds it with [`encode_query_value`]
+    /// so a value carrying `&`, `=`, or a space survives the trip through
+    /// this hand-rolled client's request line.
+    pub fn list_notes_query(&self, query: &str) -> (u16, serde_json::Value) {
+        self.request("GET", &format!("/notes?{query}"), None)
     }
 
     pub fn put_note(&self, id: &str, title: &str, body: &str) -> (u16, serde_json::Value) {

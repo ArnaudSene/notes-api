@@ -14,7 +14,7 @@
 #[path = "system/support.rs"]
 mod support;
 
-use support::{Service, database_url, unique_port};
+use support::{Service, database_url, encode_query_value, unique_marker, unique_port};
 
 #[test]
 #[ignore = "system test: needs the services"]
@@ -183,4 +183,123 @@ fn migrations_apply_cleanly_twice_in_a_row() {
     runtime
         .block_on(notes_api::store::postgres::PostgresStore::connect(&url))
         .expect("migrating the same, already-migrated database again");
+}
+
+// The four tests below are this mission's own proof obligation (see
+// MISSION.md): L1's filter and L2's window are pushed down into
+// `PostgresStore`'s SQL (L3), and a system test is the only place that SQL
+// runs for real rather than against `StubConnection`. Each uses its own
+// `unique_marker()` as a substring nothing else in the (never reset, see
+// this file's header) table is expected to contain, so a leftover note from
+// an earlier run — or another test in this same run — cannot change how
+// many rows a query here matches.
+
+#[test]
+#[ignore = "system test: needs the services"]
+fn q_matches_the_title_case_insensitively_against_the_real_database() {
+    let service = Service::start(&database_url(), "system-search-title-token", unique_port());
+    let marker = unique_marker();
+
+    let (status, matching) = service.post_note(&format!("Groceries-{marker}"), "milk, eggs");
+    assert_eq!(status, 201);
+    let (status, _other) = service.post_note("taxes", "file by april");
+    assert_eq!(status, 201);
+
+    // Upper-cased, against a title that carries it lower-cased: proves the
+    // real `ILIKE` answers the same case-insensitivity question
+    // `ListQuery::matches` does for `MemoryStore`, not just the parameter
+    // `PostgresStore::list`'s unit tests already checked reaches the
+    // driver.
+    let query = format!(
+        "q={}",
+        encode_query_value(&format!("groceries-{marker}").to_uppercase())
+    );
+    let (status, notes) = service.list_notes_query(&query);
+
+    assert_eq!(status, 200);
+    let notes = notes.as_array().expect("a JSON array");
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["id"], matching["id"]);
+}
+
+#[test]
+#[ignore = "system test: needs the services"]
+fn q_matches_the_body_against_the_real_database() {
+    let service = Service::start(&database_url(), "system-search-body-token", unique_port());
+    let marker = unique_marker();
+
+    let (status, matching) = service.post_note("shopping", &format!("call the plumber-{marker}"));
+    assert_eq!(status, 201);
+    let (status, _other) = service.post_note("unrelated", "nothing about plumbing here");
+    assert_eq!(status, 201);
+
+    let query = format!("q={}", encode_query_value(&marker));
+    let (status, notes) = service.list_notes_query(&query);
+
+    assert_eq!(status, 200);
+    let notes = notes.as_array().expect("a JSON array");
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["id"], matching["id"]);
+}
+
+#[test]
+#[ignore = "system test: needs the services"]
+fn limit_and_offset_page_through_matches_in_total_order_on_the_real_database() {
+    let service = Service::start(&database_url(), "system-paging-token", unique_port());
+    let marker = unique_marker();
+
+    // Created oldest to newest; `seq DESC` lists newest first, so the
+    // expected order is the reverse of creation.
+    let mut created = Vec::new();
+    for i in 0..5 {
+        let (status, note) = service.post_note(&format!("paging-{marker}-{i}"), "");
+        assert_eq!(status, 201);
+        created.push(note);
+    }
+    created.reverse();
+
+    let query_base = format!("q={}", encode_query_value(&marker));
+    let mut paged = Vec::new();
+    for offset in [0, 2, 4] {
+        let (status, notes) =
+            service.list_notes_query(&format!("{query_base}&limit=2&offset={offset}"));
+        assert_eq!(status, 200);
+        paged.extend(notes.as_array().expect("a JSON array").clone());
+    }
+
+    let paged_ids: Vec<_> = paged.iter().map(|note| note["id"].clone()).collect();
+    let expected_ids: Vec<_> = created.iter().map(|note| note["id"].clone()).collect();
+    assert_eq!(
+        paged_ids, expected_ids,
+        "paging by a fixed limit over the filtered rows must reconstruct \
+         the original, newest-first sequence exactly: nothing skipped, \
+         nothing repeated"
+    );
+}
+
+#[test]
+#[ignore = "system test: needs the services"]
+fn a_sql_injection_shaped_title_round_trips_through_the_real_database() {
+    let service = Service::start(&database_url(), "system-injection-token", unique_port());
+    let marker = unique_marker();
+    // The mission's own example (MISSION.md): a title that looks like SQL
+    // is still just a note, whatever carries it to the database.
+    let title = format!("'; drop table notes; --{marker}");
+
+    let (status, created) = service.post_note(&title, "still just data");
+    assert_eq!(status, 201);
+    assert_eq!(created["title"], title);
+
+    let query = format!("q={}", encode_query_value(&title));
+    let (status, notes) = service.list_notes_query(&query);
+
+    assert_eq!(status, 200);
+    let notes = notes.as_array().expect("a JSON array");
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["id"], created["id"]);
+
+    // The table is still there: an ordinary request right after this one
+    // still works, rather than failing because `notes` is gone.
+    let (status, _) = service.list_notes();
+    assert_eq!(status, 200);
 }
