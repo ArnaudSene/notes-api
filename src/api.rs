@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::store::Store;
+use crate::store::{ListQuery, Store};
 
 /// What every handler shares: the store notes live in, and the token every
 /// request must carry.
@@ -111,11 +111,84 @@ async fn delete_note(State(state): State<AppState>, Path(id): Path<String>) -> R
     }
 }
 
-async fn list_notes(State(state): State<AppState>) -> Response {
-    match state.store.list() {
+async fn list_notes(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> Response {
+    let query = ListQuery {
+        q: q_param(raw_query.as_deref()),
+        limit: numeric_param(raw_query.as_deref(), "limit"),
+        offset: numeric_param(raw_query.as_deref(), "offset"),
+    };
+
+    match state.store.list(&query) {
         Ok(notes) => (StatusCode::OK, Json(notes)).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+/// The raw, still percent-encoded value of `key` in a raw query string, or
+/// `None` when the string is absent or carries no pair for `key`. The one
+/// place both `q_param` and `numeric_param` split `k=v&k2=v2` apart, so
+/// that stays defined once.
+fn raw_param<'a>(raw_query: Option<&'a str>, key: &str) -> Option<&'a str> {
+    raw_query?
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, value)| value)
+}
+
+/// The `q` parameter out of a raw query string, percent-decoded, or `None`
+/// when it is absent or decodes to an empty string. `axum`'s `Query`
+/// extractor would pull in `serde_urlencoded` for this; one parameter is
+/// not worth that dependency, so it is read by hand instead.
+fn q_param(raw_query: Option<&str>) -> Option<String> {
+    let value = percent_decode(raw_param(raw_query, "q")?);
+
+    if value.is_empty() { None } else { Some(value) }
+}
+
+/// `key`'s value, parsed as a non-negative integer, or `None` when it is
+/// absent or is not one — malformed input falls back to the service's
+/// default for `limit`/`offset` rather than rejecting the request.
+fn numeric_param(raw_query: Option<&str>, key: &str) -> Option<u32> {
+    raw_param(raw_query, key)?.parse().ok()
+}
+
+/// Decodes `+` as a space and a `%XX` escape as the byte it encodes. A `%`
+/// not followed by two hex digits, or any other byte, passes through
+/// unchanged; bytes that do not form valid UTF-8 once decoded are replaced
+/// rather than causing a panic.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                decoded.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 3 <= bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+                match hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+                    Some(byte) => {
+                        decoded.push(byte);
+                        i += 3;
+                    }
+                    None => {
+                        decoded.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                i += 1;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 /// The token guard. Runs ahead of every route: a request that does not
@@ -372,6 +445,211 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let notes = body_json(response).await;
         assert_eq!(notes, serde_json::json!([]));
+    }
+
+    fn list_request(query: &str) -> HttpRequest<Body> {
+        authed(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!("/notes?{query}")),
+        )
+        .body(Body::empty())
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_notes_with_q_filters_by_title() {
+        let app = app();
+        app.clone()
+            .oneshot(create_request("groceries", "milk, eggs"))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(create_request("taxes", "file by april"))
+            .await
+            .unwrap();
+
+        let response = app.oneshot(list_request("q=groc")).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let notes = body_json(response).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["title"], "groceries");
+    }
+
+    #[tokio::test]
+    async fn get_notes_with_q_filters_by_body_too() {
+        let app = app();
+        app.clone()
+            .oneshot(create_request("groceries", "milk, eggs"))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(create_request("taxes", "file by april"))
+            .await
+            .unwrap();
+
+        let response = app.oneshot(list_request("q=eggs")).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let notes = body_json(response).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["title"], "groceries");
+    }
+
+    #[tokio::test]
+    async fn get_notes_with_q_is_case_insensitive() {
+        let app = app();
+        app.clone()
+            .oneshot(create_request("Groceries", "Milk, Eggs"))
+            .await
+            .unwrap();
+
+        let response = app.oneshot(list_request("q=EGGS")).await.unwrap();
+
+        let notes = body_json(response).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_notes_with_a_q_matching_nothing_is_an_empty_array() {
+        let app = app();
+        app.clone()
+            .oneshot(create_request("groceries", "milk, eggs"))
+            .await
+            .unwrap();
+
+        let response = app.oneshot(list_request("q=bread")).await.unwrap();
+
+        let notes = body_json(response).await;
+        assert_eq!(notes, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn get_notes_with_an_empty_q_returns_everything() {
+        let app = app();
+        app.clone()
+            .oneshot(create_request("groceries", "milk, eggs"))
+            .await
+            .unwrap();
+
+        let response = app.oneshot(list_request("q=")).await.unwrap();
+
+        let notes = body_json(response).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_notes_without_q_returns_everything() {
+        let app = app();
+        app.clone()
+            .oneshot(create_request("groceries", "milk, eggs"))
+            .await
+            .unwrap();
+
+        let response = app.oneshot(list_request("")).await.unwrap();
+
+        let notes = body_json(response).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_notes_with_a_percent_encoded_q_decodes_it() {
+        let app = app();
+        app.clone()
+            .oneshot(create_request("milk and eggs", "a list"))
+            .await
+            .unwrap();
+
+        let response = app
+            .oneshot(list_request("q=milk%20and%20eggs"))
+            .await
+            .unwrap();
+
+        let notes = body_json(response).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_notes_with_a_limit_returns_only_that_many() {
+        let app = app();
+        app.clone().oneshot(create_request("a", "")).await.unwrap();
+        app.clone().oneshot(create_request("b", "")).await.unwrap();
+        app.clone().oneshot(create_request("c", "")).await.unwrap();
+
+        let response = app.oneshot(list_request("limit=2")).await.unwrap();
+
+        let notes = body_json(response).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_notes_with_an_offset_skips_that_many() {
+        let app = app();
+        app.clone()
+            .oneshot(create_request("first", ""))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(create_request("second", ""))
+            .await
+            .unwrap();
+
+        // Newest first: second, first. Skipping 1 leaves only "first".
+        let response = app.oneshot(list_request("offset=1")).await.unwrap();
+
+        let notes = body_json(response).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["title"], "first");
+    }
+
+    #[tokio::test]
+    async fn get_notes_pages_through_with_limit_and_offset_together() {
+        let app = app();
+        app.clone()
+            .oneshot(create_request("first", ""))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(create_request("second", ""))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(create_request("third", ""))
+            .await
+            .unwrap();
+
+        // Newest first: third, second, first. limit=1&offset=1 -> second.
+        let response = app.oneshot(list_request("limit=1&offset=1")).await.unwrap();
+
+        let notes = body_json(response).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["title"], "second");
+    }
+
+    #[tokio::test]
+    async fn get_notes_with_a_malformed_limit_falls_back_to_the_default() {
+        let app = app();
+        app.clone().oneshot(create_request("a", "")).await.unwrap();
+
+        let response = app
+            .oneshot(list_request("limit=not-a-number"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let notes = body_json(response).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 1);
     }
 
     #[tokio::test]
@@ -788,5 +1066,126 @@ mod tests {
     #[test]
     fn constant_time_eq_rejects_a_single_differing_byte() {
         assert!(!constant_time_eq(b"aaaa", b"aaab"));
+    }
+
+    #[test]
+    fn raw_param_reads_the_pair_it_is_asked_for() {
+        assert_eq!(raw_param(Some("q=milk"), "q"), Some("milk"));
+    }
+
+    #[test]
+    fn raw_param_is_none_when_there_is_no_query_string() {
+        assert_eq!(raw_param(None, "q"), None);
+    }
+
+    #[test]
+    fn raw_param_is_none_when_the_key_is_absent() {
+        assert_eq!(raw_param(Some("limit=10"), "q"), None);
+    }
+
+    #[test]
+    fn raw_param_ignores_other_parameters() {
+        assert_eq!(
+            raw_param(Some("limit=10&q=milk&offset=5"), "q"),
+            Some("milk")
+        );
+    }
+
+    #[test]
+    fn raw_param_does_not_decode_its_value() {
+        // Percent-decoding is `q_param`'s job, layered on top; `raw_param`
+        // itself hands back exactly the bytes between `=` and `&`.
+        assert_eq!(
+            raw_param(Some("q=milk%20and%20eggs"), "q"),
+            Some("milk%20and%20eggs")
+        );
+    }
+
+    #[test]
+    fn q_param_reads_q_out_of_the_raw_query() {
+        assert_eq!(q_param(Some("q=milk")), Some("milk".to_string()));
+    }
+
+    #[test]
+    fn q_param_is_none_when_there_is_no_query_string() {
+        assert_eq!(q_param(None), None);
+    }
+
+    #[test]
+    fn q_param_is_none_when_the_query_string_has_no_q() {
+        assert_eq!(q_param(Some("limit=10")), None);
+    }
+
+    #[test]
+    fn q_param_is_none_when_q_is_empty() {
+        assert_eq!(q_param(Some("q=")), None);
+    }
+
+    #[test]
+    fn q_param_ignores_other_parameters() {
+        assert_eq!(
+            q_param(Some("limit=10&q=milk&offset=5")),
+            Some("milk".to_string())
+        );
+    }
+
+    #[test]
+    fn q_param_decodes_the_value_it_reads() {
+        assert_eq!(
+            q_param(Some("q=milk%20and%20eggs")),
+            Some("milk and eggs".to_string())
+        );
+    }
+
+    #[test]
+    fn numeric_param_reads_the_pair_it_is_asked_for() {
+        assert_eq!(numeric_param(Some("limit=10"), "limit"), Some(10));
+        assert_eq!(numeric_param(Some("offset=5"), "offset"), Some(5));
+    }
+
+    #[test]
+    fn numeric_param_is_none_when_there_is_no_query_string() {
+        assert_eq!(numeric_param(None, "limit"), None);
+    }
+
+    #[test]
+    fn numeric_param_is_none_when_the_key_is_absent() {
+        assert_eq!(numeric_param(Some("q=milk"), "limit"), None);
+    }
+
+    #[test]
+    fn numeric_param_is_none_when_the_value_is_not_a_number() {
+        assert_eq!(numeric_param(Some("limit=ten"), "limit"), None);
+    }
+
+    #[test]
+    fn numeric_param_is_none_when_the_value_is_negative() {
+        assert_eq!(numeric_param(Some("limit=-1"), "limit"), None);
+    }
+
+    #[test]
+    fn numeric_param_ignores_other_parameters() {
+        assert_eq!(numeric_param(Some("q=milk&limit=10"), "limit"), Some(10));
+    }
+
+    #[test]
+    fn percent_decode_turns_a_plus_into_a_space() {
+        assert_eq!(percent_decode("milk+and+eggs"), "milk and eggs");
+    }
+
+    #[test]
+    fn percent_decode_turns_a_percent_escape_into_its_byte() {
+        assert_eq!(percent_decode("100%25"), "100%");
+    }
+
+    #[test]
+    fn percent_decode_leaves_ordinary_text_alone() {
+        assert_eq!(percent_decode("groceries"), "groceries");
+    }
+
+    #[test]
+    fn percent_decode_leaves_a_malformed_escape_alone() {
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("100%zz"), "100%zz");
     }
 }

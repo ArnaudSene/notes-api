@@ -6,7 +6,7 @@ use tokio_postgres::{Client, NoTls, Row};
 use uuid::Uuid;
 
 use crate::note::Note;
-use crate::store::{Store, StoreError};
+use crate::store::{ListQuery, Store, StoreError};
 
 /// An arbitrary, fixed key for the advisory lock that serializes migrations:
 /// `CREATE TABLE IF NOT EXISTS` is not actually safe against two connections
@@ -16,14 +16,17 @@ use crate::store::{Store, StoreError};
 /// freshly-lifted database will do.
 const MIGRATION_LOCK_KEY: i64 = 0x6e6f7465732d6462u64 as i64;
 
-/// A query parameter, in the only three shapes a note's columns ever need.
-/// Unlike `&(dyn ToSql + Sync)`, a unit test can build one of these without
-/// a driver in sight.
+/// A query parameter, in the only shapes a note's columns — and now `list`'s
+/// `LIMIT`/`OFFSET` — ever need. Unlike `&(dyn ToSql + Sync)`, a unit test
+/// can build one of these without a driver in sight.
 #[derive(Debug, Clone, PartialEq)]
 enum Param {
     Uuid(Uuid),
     Text(String),
     Timestamp(DateTime<Utc>),
+    /// `LIMIT`/`OFFSET`: `BIGINT`, to match `seq`, the column they page
+    /// over.
+    Int8(i64),
 }
 
 impl Param {
@@ -32,6 +35,7 @@ impl Param {
             Param::Uuid(value) => value,
             Param::Text(value) => value,
             Param::Timestamp(value) => value,
+            Param::Int8(value) => value,
         }
     }
 }
@@ -233,10 +237,30 @@ impl Store for PostgresStore {
         Ok(row.map(Note::from))
     }
 
-    fn list(&self) -> Result<Vec<Note>, StoreError> {
+    fn list(&self, query: &ListQuery) -> Result<Vec<Note>, StoreError> {
+        // The filter and the window are both SQL's job now: `$1` is
+        // `ListQuery::like_pattern`, a bound parameter — never text spliced
+        // into the statement — so a title or body containing `'; drop
+        // table notes; --` is a row this still matches on its own terms,
+        // not SQL this runs. `$2`/`$3` are `effective_limit`/
+        // `effective_offset`, the same numbers `ListQuery::window` would
+        // apply in Rust for `MemoryStore`.
+        //
+        // This query wants an index this lot cannot add — migrations are
+        // the integrator's (see JOURNAL.md/PR.md): a trigram (`pg_trgm`
+        // `gin`) index on `title`/`body` for the two `ILIKE`s, and a btree
+        // index on `seq` for `ORDER BY ... LIMIT ... OFFSET` (`BIGSERIAL`
+        // only guarantees a sequence, not an index).
         let rows = self.conn.query(
-            "SELECT id, title, body, created_at, updated_at FROM notes ORDER BY seq DESC",
-            &[],
+            "SELECT id, title, body, created_at, updated_at FROM notes \
+             WHERE title ILIKE $1 OR body ILIKE $1 \
+             ORDER BY seq DESC \
+             LIMIT $2 OFFSET $3",
+            &[
+                Param::Text(query.like_pattern()),
+                Param::Int8(query.effective_limit() as i64),
+                Param::Int8(query.effective_offset() as i64),
+            ],
         )?;
 
         Ok(rows.into_iter().map(Note::from).collect())
@@ -454,7 +478,7 @@ mod tests {
             ..Default::default()
         });
 
-        let notes = store.list().unwrap();
+        let notes = store.list(&ListQuery::default()).unwrap();
 
         assert_eq!(notes, vec![Note::from(first), Note::from(second)]);
     }
@@ -466,23 +490,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(store.list().unwrap(), vec![]);
-    }
-
-    #[test]
-    fn list_sends_no_parameters() {
-        let calls = CallLog::default();
-        let store = store_on(StubConnection {
-            query_result: Some(Ok(vec![])),
-            calls: calls.clone(),
-            ..Default::default()
-        });
-
-        store.list().unwrap();
-
-        let (statement, params) = calls.last();
-        assert!(statement.contains("SELECT"));
-        assert_eq!(params, vec![]);
+        assert_eq!(store.list(&ListQuery::default()).unwrap(), vec![]);
     }
 
     #[test]
@@ -492,7 +500,155 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(store.list().unwrap_err().to_string(), "connection reset");
+        assert_eq!(
+            store.list(&ListQuery::default()).unwrap_err().to_string(),
+            "connection reset"
+        );
+    }
+
+    /// The statement's fixed shape: a `WHERE` on both columns, `ILIKE` (not
+    /// `LIKE`, which is case-sensitive) so the SQL answers the same
+    /// case-insensitivity question `ListQuery::matches` does for
+    /// `MemoryStore`, an unchanged `ORDER BY seq DESC`, and a `LIMIT`/
+    /// `OFFSET` that reads from `$2`/`$3` — never a number formatted
+    /// straight into the text, which
+    /// `list_sends_the_effective_limit_and_offset_as_bound_parameters`
+    /// below also pins down from the parameters side.
+    #[test]
+    fn list_sends_a_statement_with_ilike_and_a_bound_limit_and_offset() {
+        let calls = CallLog::default();
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![])),
+            calls: calls.clone(),
+            ..Default::default()
+        });
+
+        store.list(&ListQuery::default()).unwrap();
+
+        let (statement, _) = calls.last();
+        assert!(statement.contains("SELECT"));
+        assert!(statement.contains("WHERE title ILIKE $1 OR body ILIKE $1"));
+        assert!(statement.contains("ORDER BY seq DESC"));
+        assert!(statement.contains("LIMIT $2 OFFSET $3"));
+    }
+
+    #[test]
+    fn list_sends_the_like_pattern_as_its_first_parameter() {
+        let calls = CallLog::default();
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![])),
+            calls: calls.clone(),
+            ..Default::default()
+        });
+        let query = ListQuery {
+            q: Some("groc".to_string()),
+            ..Default::default()
+        };
+
+        store.list(&query).unwrap();
+
+        let (_, params) = calls.last();
+        assert_eq!(params[0], Param::Text(query.like_pattern()));
+        assert_eq!(params[0], Param::Text("%groc%".to_string()));
+    }
+
+    #[test]
+    fn list_sends_a_bare_wildcard_pattern_when_there_is_no_q() {
+        let calls = CallLog::default();
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![])),
+            calls: calls.clone(),
+            ..Default::default()
+        });
+
+        store.list(&ListQuery::default()).unwrap();
+
+        let (_, params) = calls.last();
+        assert_eq!(params[0], Param::Text("%%".to_string()));
+    }
+
+    #[test]
+    fn list_sends_the_effective_limit_and_offset_as_bound_parameters() {
+        let calls = CallLog::default();
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![])),
+            calls: calls.clone(),
+            ..Default::default()
+        });
+
+        store
+            .list(&ListQuery {
+                limit: Some(2),
+                offset: Some(3),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let (_, params) = calls.last();
+        assert_eq!(params[1], Param::Int8(2));
+        assert_eq!(params[2], Param::Int8(3));
+    }
+
+    #[test]
+    fn list_sends_max_limit_and_zero_offset_when_the_caller_gives_neither() {
+        let calls = CallLog::default();
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![])),
+            calls: calls.clone(),
+            ..Default::default()
+        });
+
+        store.list(&ListQuery::default()).unwrap();
+
+        let (_, params) = calls.last();
+        assert_eq!(params[1], Param::Int8(crate::store::MAX_LIMIT as i64));
+        assert_eq!(params[2], Param::Int8(0));
+    }
+
+    #[test]
+    fn list_clamps_a_limit_above_the_ceiling_in_the_parameter_it_sends() {
+        let calls = CallLog::default();
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![])),
+            calls: calls.clone(),
+            ..Default::default()
+        });
+
+        store
+            .list(&ListQuery {
+                limit: Some(crate::store::MAX_LIMIT + 50),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let (_, params) = calls.last();
+        assert_eq!(params[1], Param::Int8(crate::store::MAX_LIMIT as i64));
+    }
+
+    /// The mission's own proof obligation for this lot: a title of `';
+    /// drop table notes; --` has to come back as a note, not run as SQL.
+    /// Since it only ever reaches the driver as a bound `Param::Text`
+    /// alongside a statement that is a fixed string, it cannot: nothing
+    /// here builds the statement by formatting `q` into it.
+    #[test]
+    fn list_sends_sql_looking_q_as_a_bound_parameter_not_statement_text() {
+        let calls = CallLog::default();
+        let store = store_on(StubConnection {
+            query_result: Some(Ok(vec![])),
+            calls: calls.clone(),
+            ..Default::default()
+        });
+        let dangerous = "'; drop table notes; --";
+        let query = ListQuery {
+            q: Some(dangerous.to_string()),
+            ..Default::default()
+        };
+
+        store.list(&query).unwrap();
+
+        let (statement, params) = calls.last();
+        assert!(!statement.contains(dangerous));
+        assert_eq!(params[0], Param::Text(format!("%{dangerous}%")));
     }
 
     #[test]

@@ -4,7 +4,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::note::Note;
-use crate::store::{Store, StoreError};
+use crate::store::{ListQuery, Store, StoreError};
 
 /// Keeps notes in memory, in the order they were created. Nothing here
 /// survives the process — it exists for tests and for a service run without
@@ -49,13 +49,20 @@ impl Store for MemoryStore {
         Ok(notes.iter().find(|note| note.id == id).cloned())
     }
 
-    fn list(&self) -> Result<Vec<Note>, StoreError> {
+    fn list(&self, query: &ListQuery) -> Result<Vec<Note>, StoreError> {
         let notes = self
             .notes
             .lock()
             .map_err(|_| StoreError("the store's lock was poisoned".to_string()))?;
 
-        Ok(notes.iter().rev().cloned().collect())
+        let matched: Vec<Note> = notes
+            .iter()
+            .rev()
+            .filter(|note| query.matches(note))
+            .cloned()
+            .collect();
+
+        Ok(query.window(matched))
     }
 
     fn update(&self, id: Uuid, title: String, body: String) -> Result<Option<Note>, StoreError> {
@@ -152,7 +159,7 @@ mod tests {
     fn list_is_empty_for_a_fresh_store() {
         let store = MemoryStore::new();
 
-        let notes = store.list().unwrap();
+        let notes = store.list(&ListQuery::default()).unwrap();
 
         assert_eq!(notes, Vec::new());
     }
@@ -163,7 +170,7 @@ mod tests {
         store.create("a".to_string(), "a".to_string()).unwrap();
         store.create("b".to_string(), "b".to_string()).unwrap();
 
-        let notes = store.list().unwrap();
+        let notes = store.list(&ListQuery::default()).unwrap();
 
         assert_eq!(notes.len(), 2);
     }
@@ -175,7 +182,7 @@ mod tests {
         let second = store.create("second".to_string(), "2".to_string()).unwrap();
         let third = store.create("third".to_string(), "3".to_string()).unwrap();
 
-        let notes = store.list().unwrap();
+        let notes = store.list(&ListQuery::default()).unwrap();
 
         assert_eq!(notes, vec![third, second, first]);
     }
@@ -283,7 +290,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let notes = store.list().unwrap();
+        let notes = store.list(&ListQuery::default()).unwrap();
 
         assert_eq!(notes, vec![third, second, first]);
     }
@@ -326,6 +333,149 @@ mod tests {
 
         store.delete(first.id).unwrap();
 
-        assert_eq!(store.list().unwrap(), vec![second]);
+        assert_eq!(store.list(&ListQuery::default()).unwrap(), vec![second]);
+    }
+
+    fn query(q: &str) -> ListQuery {
+        ListQuery {
+            q: Some(q.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn list_with_a_query_returns_only_the_notes_that_match_it() {
+        let store = MemoryStore::new();
+        store
+            .create("groceries".to_string(), "milk, eggs".to_string())
+            .unwrap();
+        store
+            .create("taxes".to_string(), "file by april".to_string())
+            .unwrap();
+
+        let notes = store.list(&query("groc")).unwrap();
+
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "groceries");
+    }
+
+    #[test]
+    fn list_with_a_query_matches_the_body_too() {
+        let store = MemoryStore::new();
+        store
+            .create("groceries".to_string(), "milk, eggs".to_string())
+            .unwrap();
+        store
+            .create("taxes".to_string(), "file by april".to_string())
+            .unwrap();
+
+        let notes = store.list(&query("eggs")).unwrap();
+
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "groceries");
+    }
+
+    #[test]
+    fn list_with_a_query_matching_nothing_is_empty() {
+        let store = MemoryStore::new();
+        store
+            .create("groceries".to_string(), "milk, eggs".to_string())
+            .unwrap();
+
+        let notes = store.list(&query("bread")).unwrap();
+
+        assert_eq!(notes, Vec::new());
+    }
+
+    #[test]
+    fn list_still_orders_matching_notes_newest_first() {
+        let store = MemoryStore::new();
+        let first = store
+            .create("first note".to_string(), "1".to_string())
+            .unwrap();
+        let second = store
+            .create("second note".to_string(), "2".to_string())
+            .unwrap();
+        let third = store
+            .create("third note".to_string(), "3".to_string())
+            .unwrap();
+
+        let notes = store.list(&query("note")).unwrap();
+
+        assert_eq!(notes, vec![third, second, first]);
+    }
+
+    #[test]
+    fn list_with_a_limit_returns_only_that_many_notes() {
+        let store = MemoryStore::new();
+        store.create("a".to_string(), "".to_string()).unwrap();
+        store.create("b".to_string(), "".to_string()).unwrap();
+        store.create("c".to_string(), "".to_string()).unwrap();
+
+        let notes = store
+            .list(&ListQuery {
+                limit: Some(2),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(notes.len(), 2);
+    }
+
+    #[test]
+    fn list_with_an_offset_skips_that_many_notes() {
+        let store = MemoryStore::new();
+        let first = store.create("first".to_string(), "".to_string()).unwrap();
+        let second = store.create("second".to_string(), "".to_string()).unwrap();
+        let _third = store.create("third".to_string(), "".to_string()).unwrap();
+
+        // Newest first: third, second, first. Skipping 1 leaves second, first.
+        let notes = store
+            .list(&ListQuery {
+                offset: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(notes, vec![second, first]);
+    }
+
+    #[test]
+    fn list_without_a_limit_is_bounded_by_the_service_default() {
+        let store = MemoryStore::new();
+        for i in 0..(crate::store::MAX_LIMIT + 1) {
+            store.create(format!("note {i}"), String::new()).unwrap();
+        }
+
+        let notes = store.list(&ListQuery::default()).unwrap();
+
+        assert_eq!(notes.len(), crate::store::MAX_LIMIT as usize);
+    }
+
+    #[test]
+    fn list_windows_the_notes_that_matched_the_query_not_everything() {
+        let store = MemoryStore::new();
+        store
+            .create("groceries".to_string(), "milk".to_string())
+            .unwrap();
+        store
+            .create("groceries again".to_string(), "eggs".to_string())
+            .unwrap();
+        store
+            .create("taxes".to_string(), "file by april".to_string())
+            .unwrap();
+
+        let notes = store
+            .list(&ListQuery {
+                q: Some("groceries".to_string()),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Without filtering first, a limit of 1 over all three notes
+        // (newest first) would return "taxes" instead.
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "groceries again");
     }
 }
